@@ -259,6 +259,7 @@ def edits(hunks):
 class Selector:
     def __init__(self, maps):
         self.m = maps
+        self.ignore_imp = False  # set after an import fingerprint showed the edit leaves import state unchanged
         self.importcheck = {}
 
     # ---------- helpers
@@ -401,14 +402,14 @@ class Selector:
                 # inside compound body but not inside a child statement (else:, blank...)
                 tests, imp = self.cov_range(d, start, end)
                 out |= tests
-                if imp:
+                if imp and not self.ignore_imp:
                     out |= self.file_users(rel, d)
                 why.append("compound")
                 continue
             if kind == "f":
                 tests, imp = self.cov_range(d, start, hdr_end)
                 out |= tests
-                if imp:
+                if imp and not self.ignore_imp:
                     vok = False
                     out |= self.file_users(rel, d)
                     out |= self.subprocess_tests(rel)
@@ -713,6 +714,13 @@ TPC_FIXED_MS = int(os.environ.get("BR_TPC_FIXED_MS", "3000"))     # imports + cl
 TPC_QUERY_MS = int(os.environ.get("BR_TPC_QUERY_MS", "260"))      # average per TPC-DS query
 TPC_CONFIRM_MAX = int(os.environ.get("BR_TPC_CONFIRM_MAX", "25"))
 TPC_DEADLINE_S = float(os.environ.get("BR_TPC_DEADLINE_S", "150"))
+MN_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+FP_ON = os.environ.get("BR_FP", "0") == "1"
+FP_DEADLINE_S = float(os.environ.get("BR_FP_DEADLINE_S", "100"))
+MN_OTHER_MAX_TEST_MS = int(os.environ.get("BR_MN_OTHER_MAX_TEST_MS", "4000"))
+MN_SUB_MS = int(os.environ.get("BR_MN_SUB_MS", "3000"))
+MN_SUB_MIN = int(os.environ.get("BR_MN_SUB_MIN", "30"))
+MN_DEADLINE_S = float(os.environ.get("BR_MN_DEADLINE_S", "160"))
 
 
 def commit_category(notes):
@@ -785,7 +793,9 @@ def main():
     ichecks = []
     probes = []    # TPC-DS query edits: run the edited queries the way test_execute_tpcds does
     special = {}   # key -> tests to keep when every cheap candidate passed (heavy skip)
+    fp_state = {}  # pinned import fingerprint (computed on first need) and its unstable keys
     tpc_code = {}  # key -> (patched sources, test_execute_tpcds query indices reaching the edit)
+    mn_code = {}   # key -> patched sources, for code edits whose candidates include test_max_nodes
     names = sorted(n for n in os.listdir(cdir) if n.endswith(".patch"))
     for name in names:
         cid = name[:-6]
@@ -793,6 +803,50 @@ def main():
             with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
             tset, notes = sel.select(text)
+            joined = " ".join(notes)
+            if (VERIFY and FP_ON and ("f-imp" in joined or "compound" in joined)
+                    and "import-time" not in joined and "class-hdr" not in joined
+                    and all(n.split(":")[0].endswith(".py") for n in notes)):
+                # the edited function also runs while modules load: compare everything module and
+                # class variables hold after importing all of sqlglot and the tests, patched vs pinned.
+                # Identical -> the edit only matters at run time: select by line coverage.
+                try:
+                    import cmpprune
+                    import verify
+                    files = cmpprune.code_patch_files(text, SRC)
+                    if files:
+                        if fp_state.get("orig") is None:
+                            for lib in ("duckdb", "numpy", "pandas", "pandas.testing", "unittest.mock"):
+                                try:
+                                    __import__(lib)
+                                except BaseException:
+                                    pass
+                            a = verify.import_fingerprint(SRC, {}, t0 + FP_DEADLINE_S, log)
+                            b = verify.import_fingerprint(SRC, {}, t0 + FP_DEADLINE_S, log)
+                            if a and b:
+                                fp_state["orig"] = a
+                                fp_state["unstable"] = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+                            else:
+                                fp_state["orig"] = {}
+                        orig = fp_state["orig"]
+                        if orig:
+                            c = verify.import_fingerprint(SRC, files, t0 + FP_DEADLINE_S, log)
+                            if c is not None:
+                                bad = [k for k in set(orig) | set(c)
+                                       if k not in fp_state["unstable"] and orig.get(k) != c.get(k)]
+                                if not bad:
+                                    sel.ignore_imp = True
+                                    try:
+                                        t2, n2 = sel.select(text)
+                                    finally:
+                                        sel.ignore_imp = False
+                                    if len(t2) < len(tset):
+                                        notes = n2 + [f"fp-same:{len(tset)}->{len(t2)}"]
+                                        tset = t2
+                                else:
+                                    notes = notes + [f"fp-diff:{len(bad)}"]
+                except Exception as e:
+                    log("fingerprint error", cid, repr(e))
             nums = {num_of[maps.ids[t]] for t in tset if maps.ids[t] in num_of}
             if tset == maps.all:
                 nums |= set(unknown)
@@ -861,6 +915,15 @@ def main():
                     tp_info = None
                 if tp_info is not None:
                     tpc_code[len(results)] = tp_info
+            if VERIFY and tset and tset != maps.all and any(maps.ids[t] == MN_ID for t in tset):
+                try:
+                    import cmpprune
+                    mfiles = cmpprune.code_patch_files(text, SRC)
+                except Exception as e:
+                    log("maxnodes-files error", cid, repr(e))
+                    mfiles = None
+                if mfiles:
+                    mn_code[len(results)] = mfiles
             if sel.importcheck and not fresh_job:
                 ichecks.append((len(results), dict(sel.importcheck)))
         except Exception as e:  # never crash: run everything for this commit
@@ -969,6 +1032,22 @@ def main():
                     r[2] = r[2] + [f"tpcds-confirm:{len(q)}:{'pass' if ok else 'restored'}"]
         except Exception as e:
             log("tpcds-code error", repr(e))
+    # test_max_nodes (~29 s) on code edits: run a shrunken copy of every step of it on the patched
+    # sources (well under a second, CPU-capped); drop the real test when the copy passes.
+    if MN_ID in num_of and mn_code:
+        mnum = num_of[MN_ID]
+        try:
+            import verify
+            for key, files in sorted(mn_code.items()):
+                r = results[key]
+                if mnum not in r[1] or set(r[1]) == set(ms_of):
+                    continue
+                ok = verify.maxnodes_proxy(SRC, files, t0 + MN_DEADLINE_S, log)
+                if ok:
+                    r[1] = set(r[1]) - {mnum}
+                r[2] = r[2] + [f"maxnodes:{'drop' if ok else 'kept'}"]
+        except Exception as e:
+            log("maxnodes error", repr(e))
     # Ablation probe (practice board only): drop selections for one category of commit.
     probe = os.environ.get("BR_ABLATE") or (open(os.path.join(HERE, "ABLATE")).read().strip()
                                               if os.path.exists(os.path.join(HERE, "ABLATE")) else "")

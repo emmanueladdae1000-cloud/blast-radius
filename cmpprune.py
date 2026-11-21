@@ -283,3 +283,34 @@ def tpcds_queries(patch_text, src_root):
     if not out_files:
         return None
     return out_files, sorted(q)
+
+
+def code_patch_files(patch_text, src_root):
+    """{rel: patched source} for a patch that only edits existing sqlglot/*.py files with at least one
+    non-comment change; None otherwise."""
+    files = parse_unified_diff(patch_text)
+    if not files:
+        return None
+    out = {}
+    for rel, info in files.items():
+        if not rel.endswith(".py") or not rel.startswith("sqlglot/"):
+            return None
+        if info["is_new"] or info["is_deleted"] or info["is_binary"] or not info["hunks"]:
+            return None
+        if info["old_path"] != info["new_path"]:
+            return None
+        path = os.path.join(src_root, rel)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            old_src = fh.read()
+        new_src = apply_hunks(old_src, info["hunks"])
+        if new_src is None:
+            return None
+        try:
+            if ast.dump(ast.parse(old_src)) == ast.dump(ast.parse(new_src)):
+                continue
+        except SyntaxError:
+            return None
+        out[rel] = new_src
+    return out or None

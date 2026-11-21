@@ -529,3 +529,271 @@ def tpcds_code_probe(src_root, files, qidx, deadline, log):
         pass
     log("tpcds-code-probe", len(qidx), "pass" if ok else "fail/unknown")
     return ok
+
+
+def _fresh_patched(src_root, files):
+    """In a forked child: drop any sqlglot/tests modules the parent holds, import the patched sources."""
+    for name in list(sys.modules):
+        if name in ("sqlglot", "tests") or name.startswith(("sqlglot.", "tests.")):
+            del sys.modules[name]
+    _setup(src_root)
+    mods = _install_finder(src_root, files)
+    _import_patched(mods)
+    for rel in files:
+        m = sys.modules.get(rel[:-3].replace("/", ".").removesuffix(".__init__"))
+        if m is None or type(getattr(m, "__spec__", None).loader).__name__ != "Loader":
+            raise RuntimeError("patched module not loaded: " + rel)
+
+
+def _child_result(fn, tmo, tag):
+    out = os.path.join("/tmp", f"{tag}_{os.getpid()}.json")
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            res = fn()
+            with open(out, "w") as fh:
+                json.dump(res, fh)
+            code = 0
+        except BaseException:
+            code = 1
+        finally:
+            os._exit(code)
+    st = _wait(pid, tmo)
+    res = None
+    if st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 and os.path.exists(out):
+        with open(out) as fh:
+            res = json.load(fh)
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    return res
+
+
+def maxnodes_check(src_root, files, mn_tidx, others, ids, deadline, log, cap_s=2.5):
+    """test_max_nodes on a code edit.  Step 1: run it for at most cap_s CPU seconds; a failure in
+    that window means keep it.  Step 2: run every other remaining candidate on the patched sources.
+    Returns (drop_max_nodes, passed_others): drop only when step 1 did not fail and step 2 passed
+    every test (on mutants of the pinned commit test_max_nodes never failed while all the other
+    tests that execute the edited line passed)."""
+    tmo = deadline - time.time()
+    if tmo < 10:
+        return False, []
+
+    def step1():
+        _fresh_patched(src_root, files)
+        import importlib
+        f, c, m = ids[mn_tidx].split("::")
+        mod = importlib.import_module(f[:-3].replace("/", "."))
+        state = {"cut": False}
+
+        def on_prof(signum, frame):
+            state["cut"] = True
+            raise KeyboardInterrupt()
+
+        signal.signal(signal.SIGPROF, on_prof)
+        r = _Result()
+        signal.setitimer(signal.ITIMER_PROF, cap_s)
+        try:
+            getattr(mod, c)(m).run(r)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            signal.setitimer(signal.ITIMER_PROF, 0)
+        failed = bool(r.bad or r.failures or r.errors or r.unexpectedSuccesses)
+        return {"cut": state["cut"], "failed": failed and not state["cut"]}
+
+    a = _child_result(step1, min(cap_s * 4 + 15, tmo), "mn1")
+    if a is None or a["failed"] or not a["cut"]:
+        # failed fast (keep), crashed (keep), or finished: a finished passing run is itself proof
+        if a is not None and not a["failed"] and not a["cut"]:
+            log("maxnodes: completed and passed")
+            return True, []
+        log("maxnodes: step1", a)
+        return False, []
+    if not others:
+        log("maxnodes: no other candidates")
+        return False, []
+
+    def step2():
+        import importlib
+        _fresh_patched(src_root, files)
+        by_file = {}
+        for f in sorted({ids[t].split("::")[0] for t in others}):
+            by_file[f] = importlib.import_module(f[:-3].replace("/", "."))
+        failed, unrun = _run_tests(others, ids, by_file)
+        return {"failed": failed, "unrun": unrun}
+
+    b = _child_result(step2, max(5.0, deadline - time.time()), "mn2")
+    if b is None or b["failed"] or b["unrun"]:
+        log("maxnodes: others", None if b is None else (len(b["failed"]), len(b["unrun"])))
+        return False, []
+    log("maxnodes: all", len(others), "others passed -> drop")
+    return True, list(others)
+
+
+def _fp(val, depth, seen):
+    """Stable text fingerprint of an import-time value (no addresses)."""
+    import enum
+    t = type(val)
+    if val is None or t in (bool, int, float, complex, str, bytes):
+        return repr(val)
+    if depth <= 0:
+        return "<" + t.__qualname__ + ">"
+    vid = id(val)
+    if vid in seen:
+        return "<cyc:" + t.__qualname__ + ">"
+    seen.add(vid)
+    try:
+        if isinstance(val, enum.Enum):
+            return repr(val)
+        if t in (list, tuple):
+            return "[" + ",".join(_fp(v, depth - 1, seen) for v in val) + "]"
+        if t in (set, frozenset):
+            return "{" + ",".join(sorted(_fp(v, depth - 1, seen) for v in val)) + "}"
+        if isinstance(val, dict):
+            items = sorted((_fp(k, depth - 1, seen), _fp(v, depth - 1, seen)) for k, v in val.items())
+            return "{" + ",".join(k + ":" + v for k, v in items) + "}"
+        if isinstance(val, type):
+            return "cls:" + getattr(val, "__module__", "") + "." + val.__qualname__
+        if isinstance(val, (types.FunctionType, types.MethodType)):
+            f = getattr(val, "__func__", val)
+            cells = []
+            for c in f.__closure__ or ():
+                try:
+                    cells.append(_fp(c.cell_contents, depth - 1, seen))
+                except ValueError:
+                    cells.append("<empty>")
+            return ("fn:" + f.__module__ + "." + f.__qualname__ + _fp(f.__defaults__, depth - 1, seen)
+                    + _fp(f.__kwdefaults__, depth - 1, seen) + "[" + ",".join(cells) + "]")
+        if isinstance(val, types.ModuleType):
+            return "mod:" + val.__name__
+        if isinstance(val, (staticmethod, classmethod)):
+            return "sm:" + _fp(val.__func__, depth - 1, seen)
+        if isinstance(val, property):
+            return "prop:" + _fp(val.fget, depth - 1, seen)
+        mod = getattr(t, "__module__", "") or ""
+        if mod.startswith("sqlglot") and hasattr(val, "sql") and hasattr(val, "args"):
+            return "expr:" + repr(val)
+        d = getattr(val, "__dict__", None)
+        if isinstance(d, dict):
+            return "obj:" + t.__qualname__ + _fp(d, depth - 1, seen)
+        return "<" + t.__qualname__ + ">"
+    except BaseException:
+        return "<err:" + t.__qualname__ + ">"
+    finally:
+        seen.discard(vid)
+
+
+def import_fingerprint(src_root, files, deadline, log):
+    """Import every sqlglot module and every test module (patched sources when given) in a forked
+    child and return {"module.name": digest} over module globals and class attributes."""
+    import hashlib
+
+    def job():
+        import importlib
+        if files:
+            _fresh_patched(src_root, files)
+        else:
+            for name in list(sys.modules):
+                if name in ("sqlglot", "tests") or name.startswith(("sqlglot.", "tests.")):
+                    del sys.modules[name]
+            _setup(src_root)
+        names = []
+        for root, _dirs, fns in os.walk(os.path.join(src_root, "sqlglot")):
+            for fn in sorted(fns):
+                if fn.endswith(".py") and fn != "__main__.py":
+                    rel = os.path.relpath(os.path.join(root, fn), src_root)
+                    names.append(rel[:-3].replace(os.sep, ".").removesuffix(".__init__"))
+        for root, _dirs, fns in os.walk(os.path.join(src_root, "tests")):
+            for fn in sorted(fns):
+                if fn.startswith("test_") and fn.endswith(".py") and fn != "test_sqlglotc.py":
+                    rel = os.path.relpath(os.path.join(root, fn), src_root)
+                    names.append(rel[:-3].replace(os.sep, "."))
+        devnull = open(os.devnull, "w")
+        old = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = devnull
+        try:
+            for n in sorted(names):
+                try:
+                    importlib.import_module(n)
+                except BaseException:
+                    pass
+        finally:
+            sys.stdout, sys.stderr = old
+        out = {}
+        for mname, mod in sorted(sys.modules.items()):
+            if mod is None or not (mname in ("sqlglot", "tests") or mname.startswith(("sqlglot.", "tests."))):
+                continue
+            for k, v in sorted(vars(mod).items()):
+                if k.startswith("__") and k.endswith("__"):
+                    continue
+                if isinstance(v, type) and getattr(v, "__module__", None) == mname:
+                    for ck, cv in sorted(vars(v).items()):
+                        if ck in ("__dict__", "__weakref__", "__doc__", "__module__", "__qualname__"):
+                            continue
+                        out[mname + "." + k + "." + ck] = hashlib.sha1(_fp(cv, 7, set()).encode()).hexdigest()[:16]
+                else:
+                    out[mname + "." + k] = hashlib.sha1(_fp(v, 7, set()).encode()).hexdigest()[:16]
+        return out
+
+    tmo = deadline - time.time()
+    if tmo < 15:
+        return None
+    return _child_result(job, min(60, tmo), "fp")
+
+
+def maxnodes_proxy(src_root, files, deadline, log, cap_s=4.0):
+    """Cheap stand-in for TestParser.test_max_nodes on patched sources: every step of the test, with
+    the huge statement shrunk from 10000 to 600 columns (about 60k counted nodes, past both limits),
+    under a CPU cap so that a slowdown counts as a failure.  True when every step behaves as the test
+    expects."""
+    tmo = deadline - time.time()
+    if tmo < 8:
+        return False
+
+    def job():
+        _fresh_patched(src_root, files)
+        from sqlglot import exp, parse_one
+        from sqlglot.errors import ParseError
+
+        state = {"slow": False}
+
+        def on_prof(signum, frame):
+            state["slow"] = True
+            raise KeyboardInterrupt()
+
+        signal.signal(signal.SIGPROF, on_prof)
+        signal.setitimer(signal.ITIMER_PROF, cap_s)
+        ok = False
+        try:
+            assert isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+            cols = [f"col{i}" for i in range(500)]
+            assert isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select)
+            expr = "x" + "=x" * 100
+            sql = f"SELECT {','.join(expr for _ in range(600))}"
+            for limit, needle in ((20_000, "Maximum number of AST nodes"), (50_000, "(50000)")):
+                try:
+                    parse_one(sql, max_nodes=limit)
+                    raise AssertionError("no ParseError")
+                except ParseError as e:
+                    assert needle in str(e)
+            try:
+                parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+                raise AssertionError("no ParseError")
+            except ParseError:
+                pass
+            assert isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+            ok = True
+        except KeyboardInterrupt:
+            ok = False
+        except BaseException:
+            ok = False
+        finally:
+            signal.setitimer(signal.ITIMER_PROF, 0)
+        return {"ok": ok and not state["slow"], "slow": state["slow"]}
+
+    r = _child_result(job, min(cap_s * 3 + 10, tmo), "mnp")
+    log("maxnodes-proxy", r)
+    return bool(r and r["ok"])
