@@ -57,19 +57,39 @@ M = sys.monitoring
 TOOL = 3
 PREFIXES = (ROOT + "/sqlglot/", ROOT + "/tests/")
 LINES = set()
+LAMS = set()
 def _line(code, line):
     f = code.co_filename
     if f.startswith(PREFIXES):
         LINES.add((f[len(ROOT) + 1:], line))
+        if code.co_name == "<lambda>":
+            LAMS.add((f[len(ROOT) + 1:], line))
+    return M.DISABLE
+def _pystart(code, offset):
+    # one-line functions/lambdas never raise a LINE event for their only line
+    f = code.co_filename
+    if f.startswith(PREFIXES):
+        rel = f[len(ROOT) + 1:]
+        ls = {code.co_firstlineno}
+        for _, _, ln in code.co_lines():
+            if ln is not None:
+                ls.add(ln)
+                break
+        for ln in ls:
+            LINES.add((rel, ln))
+            if code.co_name == "<lambda>":
+                LAMS.add((rel, ln))
     return M.DISABLE
 def start():
     LINES.clear()
     M.use_tool_id(TOOL, "forktrace")
     M.register_callback(TOOL, M.events.LINE, _line)
-    M.set_events(TOOL, M.events.LINE)
+    M.register_callback(TOOL, M.events.PY_START, _pystart)
+    M.set_events(TOOL, M.events.LINE | M.events.PY_START)
 def stop():
     M.set_events(TOOL, 0)
     M.register_callback(TOOL, M.events.LINE, None)
+    M.register_callback(TOOL, M.events.PY_START, None)
     M.free_tool_id(TOOL)
     M.restart_events()
     s = sorted(LINES); LINES.clear(); return s
@@ -87,7 +107,8 @@ for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         importlib.import_module(m.name)
     except BaseException as e:
         failed.append([m.name, repr(e)[:200]])
-dump("_import.json", {"lines": stop(), "failed": failed})
+_lams = sorted(LAMS)
+dump("_import.json", {"lines": stop(), "lams": _lams, "failed": failed})
 
 # ---- usage hooks
 SEEN = set()

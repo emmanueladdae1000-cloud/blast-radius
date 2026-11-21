@@ -1,5 +1,5 @@
 """Build the committed map from fork-trace data + pinned sources."""
-import json, os, sys, glob, ast, re
+import json, os, sys, glob, ast, re, gzip
 from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import analyze
@@ -33,6 +33,9 @@ imp = json.load(open(f"{FT}/_import.json"))
 implines = defaultdict(set)
 for f, l in imp["lines"]:
     implines[f].add(l)
+implams = defaultdict(set)
+for f, l in imp.get("lams", []):
+    implams[f].add(l)
 for path in glob.glob(f"{FT}/t*.json"):
     n = int(os.path.basename(path)[1:-5]); d = json.load(open(path))
     add(d["lines"], {n}); add_seen(d["seen"], {n}, d["mro"])
@@ -83,9 +86,9 @@ for p in srcfiles:
         if key not in setid:
             setid[key] = len(sets); sets.append(list(key))
         covl[l] = setid[key]
-    rec = {"cov": covl, "sets": sets, "imp": sorted(implines.get(rel, ())), "stmts": stm, "strs": strs, "lams": analyze.lambda_spans(src)}
+    rec = {"cov": covl, "sets": sets, "imp": sorted(implines.get(rel, ())), "stmts": stm, "strs": strs, "lams": analyze.lambda_spans(src), "implam": sorted(implams.get(rel, ()))}
     out = os.path.join(OUT, "src", rel.replace("/", "__") + ".json")
-    json.dump(rec, open(out, "w"), separators=(",", ":"))
+    gzip.open(out + ".gz", "wt").write(json.dumps(rec, separators=(",", ":")))
 
 # readers for every name that is an assignment target / class name / def name
 wanted = set()
@@ -114,6 +117,6 @@ for name in wanted:
 usage = {c: sid(s) for c, s in users.items()}
 fixtures = {p: sorted(s) for p, s in reads.items()}
 json.dump({"tests": ids, "testfile": testfile, "testclass": testclass, "readers": readers, "usage": usage,
-           "fixtures": fixtures, "sets": gsets}, open(os.path.join(OUT, "meta.json"), "w"), separators=(",", ":"))
+           "fixtures": fixtures, "sets": gsets}, gzip.open(os.path.join(OUT, "meta.json.gz"), "wt"), separators=(",", ":"))
 tot = sum(os.path.getsize(p) for p in glob.glob(OUT + "/**", recursive=True) if os.path.isfile(p))
 print("map bytes", tot, "readers", len(readers), "usage", len(usage), "gsets", len(gsets))

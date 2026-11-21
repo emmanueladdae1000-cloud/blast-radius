@@ -34,6 +34,22 @@ At run time (`selector.py`), for every changed file in a patch:
 - fixture edits select the tests that read the fixture;
 - added/deleted/renamed modules and root config files select everything.
 
+Two run-time checks refine that (both run sqlglot inside the container, which the
+rules allow and charge as CPU):
+
+- **Import check** (`verify.import_check`): for any edit to import-time code, the
+  patched module is imported in a throwaway child (served from the patch, not the
+  disk). If importing it raises, every test is selected.
+- **Candidate verification** (`verify.run`): when every real edit sits inside function
+  bodies that never run at import time and the candidate tests are few and cheap, a
+  forked child swaps the patched function bodies into the live functions
+  (`func.__code__`, so dispatch tables and closures see them), runs the candidate
+  tests with unittest, and keeps only the ones that fail. It stops at the first
+  failure and keeps the remaining candidates unverified. A crash, a timeout or any
+  change that cannot be swapped keeps the full candidate set. Process pools are
+  replaced by an in-process executor that pickles arguments and results like a real
+  pool, so the patched code is what runs.
+
 Workers are packed longest-first for every worker count 1..8, keeping the cheapest.
 
 ## Rebuilding the map
@@ -43,5 +59,5 @@ git clone https://github.com/tobymao/sqlglot && cd sqlglot && git checkout eb11a
 pip install -r ../requirements.lock      # the labeling environment
 SKIP_INTEGRATION=0 TESTS_JSON=../sample/tests.json python ../tools/forktrace.py ../ft
 cd .. && SQLGLOT_SRC=sqlglot python tools/mkmap.py ft map sample/tests.json
-tar -czf src.tar.gz -C sqlglot $(cd sqlglot && git ls-files '*.py' | grep -E '^(sqlglot|tests)/')
+tar -czf src.tar.gz -C sqlglot $(cd sqlglot && git ls-files | grep -E '^(sqlglot|tests)/')
 ```
