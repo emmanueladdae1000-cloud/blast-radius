@@ -1059,6 +1059,13 @@ def main():
                     r[2] = r[2] + [f"tpcds-confirm-{tag}:{len(qs)}:{'pass' if ok else 'restored'}"]
         except Exception as e:
             log("tpcds-code error", repr(e))
+    # Measurement probe (practice board only): drop the two slow tests in chosen commit categories.
+    hcats = {c for c in os.environ.get("BR_HEAVY_DROP_CATS", "").split(",") if c}
+    if hcats:
+        hn = {num_of[i] for i in (MN_ID, TPCDS_ID) if i in num_of}
+        for r in results:
+            if commit_category(r[2]) in hcats:
+                r[1] = set(r[1]) - hn
     # Ablation probe (practice board only): drop selections for one category of commit.
     probe = os.environ.get("BR_ABLATE") or (open(os.path.join(HERE, "ABLATE")).read().strip()
                                               if os.path.exists(os.path.join(HERE, "ABLATE")) else "")

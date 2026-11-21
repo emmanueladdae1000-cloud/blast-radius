@@ -16,3 +16,4 @@ COPY map /app/map
 RUN python -m compileall -q /app/verify.py /app/cmpprune.py && chmod -R a+rX /app
 ENV BR_SRC=/app/src
 CMD ["python", "/app/selector.py"]
+ENV BR_HEAVY_DROP_CATS=fixture,mixed,testfile,comment
