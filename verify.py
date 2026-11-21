@@ -439,3 +439,93 @@ def tpcds_probe(src_root, pairs, changed, deadline, log):
         pass
     log("tpcds-probe", changed, "pass" if ok else "fail/unknown")
     return ok
+
+
+def tpcds_code_probe(src_root, files, qidx, deadline, log):
+    """Run test_execute_tpcds's per-query work (parse, execute with sqlglot's executor, compare with
+    DuckDB) for the queries that reach the edited lines, on the patched sources.  Stops at the first
+    failing query.  True only if every listed query passes; the remaining queries never execute a
+    changed line (per-query coverage from a cold state), so they behave as on the pinned commit."""
+    tmo = deadline - time.time()
+    if tmo < 5:
+        return False
+    if not qidx:
+        return True
+    out = os.path.join("/tmp", f"tpc_{os.getpid()}.json")
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            # the parent may already hold the unpatched modules: drop them so the patched
+            # sources are what gets imported here
+            for name in list(sys.modules):
+                if name in ("sqlglot", "tests") or name.startswith(("sqlglot.", "tests.")):
+                    del sys.modules[name]
+            _setup(src_root)
+            mods = _install_finder(src_root, files)
+            _import_patched(mods)
+            from sqlglot import parse_one
+            import tests.test_executor as te
+            for rel in files:  # refuse to report a pass unless the patched source is the one loaded
+                m = sys.modules.get(rel[:-3].replace("/", ".").removesuffix(".__init__"))
+                if m is None or getattr(m, "__spec__", None) is None or type(m.__spec__.loader).__name__ != "Loader":
+                    raise RuntimeError("patched module not loaded: " + rel)
+
+            def rt(x):
+                return pickle.loads(pickle.dumps(x))
+
+            te.TestExecutor.setUpClass()
+            te.initializer(*rt((te.TPCDS_SCHEMA, te.TestExecutor.tpcds_tables)))
+            res = _Result()
+            import cmpprune
+            base_ms = (cmpprune._load("tpcds_lines.json.gz") or {}).get("ms") or []
+
+            class _Slow(BaseException):
+                pass
+
+            def _on_prof(signum, frame):
+                raise _Slow()
+
+            signal.signal(signal.SIGPROF, _on_prof)
+            state = {"slow": False}
+
+            class Probe(te.TestExecutor):
+                def runTest(self):
+                    for i in qidx:
+                        args, sql, _ = self.tpcds_sqls[i]
+                        # a query far slower than on the pinned commit would time out in the
+                        # real run: count it as a failure
+                        lim = 3.0 * (base_ms[i] if i < len(base_ms) else 700) / 1000.0 + 1.5
+                        signal.setitimer(signal.ITIMER_PROF, lim)
+                        try:
+                            table = rt(te.mp_execute(rt(parse_one(sql)), rt(args)))
+                            if table is not None:
+                                self.subtestHelper(i, table, tpch=False)
+                        except _Slow:
+                            state["slow"] = True
+                            return
+                        finally:
+                            signal.setitimer(signal.ITIMER_PROF, 0)
+                        if res.bad:
+                            return
+
+            Probe().run(res)
+            ok = not (state["slow"] or res.bad or res.failures or res.errors or res.skipped)
+            with open(out, "w") as fh:
+                json.dump({"ok": ok}, fh)
+            code = 0
+        except BaseException:
+            code = 1
+        finally:
+            os._exit(code)
+    st = _wait(pid, tmo)
+    ok = False
+    if st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 and os.path.exists(out):
+        with open(out) as fh:
+            ok = bool(json.load(fh).get("ok"))
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    log("tpcds-code-probe", len(qidx), "pass" if ok else "fail/unknown")
+    return ok
