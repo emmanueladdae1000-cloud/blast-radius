@@ -16,7 +16,10 @@ tf.extractall('/tmp'); \
 shutil.move('/tmp/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa', '/sqlglot')"
 
 COPY coverage_map.json.gz /app/coverage_map.json.gz
+COPY import_lines.json.gz /app/import_lines.json.gz
+COPY test_costs.json /app/test_costs.json
+COPY cmp_profile.json.gz /app/cmp_profile.json.gz
 COPY selector.py /app/selector.py
-RUN chmod -R a+rX /app /sqlglot
+RUN python -m compileall -q -j 0 /sqlglot/sqlglot /sqlglot/tests > /dev/null; python /app/selector.py --build-index && chmod -R a+rX /app /sqlglot
 
 CMD ["python", "/app/selector.py"]

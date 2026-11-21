@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ast
 import builtins
@@ -298,6 +298,66 @@ def build_expr_subclasses_from_ast() -> dict[str, set[str]]:
     return closure
 
 
+ATTR_INDEX_PATH = Path("/app/attr_index.json")
+_attr_index_cache: list = []
+
+
+def load_attr_index():
+    if not _attr_index_cache:
+        try:
+            _attr_index_cache.append(json.loads(ATTR_INDEX_PATH.read_text("utf-8")))
+            _attr_index_cache[0]["dynamic"] = set(_attr_index_cache[0]["dynamic"])
+        except Exception:
+            _attr_index_cache.append(None)
+    return _attr_index_cache[0]
+
+
+def build_attr_index() -> None:
+    """Build-time index: for every class-level attribute name assigned in a class of sqlglot, every runtime
+    Load read (file, line, innermost enclosing callable start or -1).  Names that appear as string
+    constants anywhere are 'dynamic' (getattr) and never narrowed."""
+    names: set[str] = set()
+    trees = {}
+    for p in sorted((SQLGLOT / "sqlglot").rglob("*.py")):
+        rel = str(p.relative_to(SQLGLOT))
+        try:
+            tree = ast.parse(p.read_text("utf-8", errors="ignore"))
+        except SyntaxError:
+            continue
+        trees[rel] = tree
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for st in node.body:
+                    if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                        names.add(st.targets[0].id)
+                    elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                        names.add(st.target.id)
+    reads: dict[str, list] = {n: [] for n in names}
+    dynamic: set[str] = set()
+    for rel, tree in trees.items():
+        callables = [(n.lineno, n.end_lineno or n.lineno) for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in names:
+                dynamic.add(node.value)
+                continue
+            nm = None
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                nm = node.attr
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                nm = node.id
+            if nm is None or nm not in names:
+                continue
+            ln = node.lineno
+            enc = [(a, b) for a, b in callables if a <= ln <= b]
+            if not enc:
+                reads[nm].append((rel, ln, -1))
+            else:
+                inner_s, _ = min(enc, key=lambda x: (x[1] - x[0], -x[0]))
+                reads[nm].append((rel, ln, inner_s))
+    ATTR_INDEX_PATH.write_text(json.dumps({"reads": reads, "dynamic": sorted(dynamic)}), "utf-8")
+
+
 class StaticAnalyzer:
     def __init__(self, cov: dict) -> None:
         self.line_map: dict[str, dict[str, list[int]]] = cov["line_to_tests"]
@@ -351,6 +411,23 @@ class StaticAnalyzer:
         """Return exact tests executing runtime Load reads of attr_name, or None if unsafe to narrow."""
         if attr_name in self._attr_read_cache:
             return self._attr_read_cache[attr_name]
+        idx = load_attr_index()
+        if idx is not None:
+            if attr_name in idx["dynamic"]:
+                self._attr_read_cache[attr_name] = None
+                return None
+            locs = idx["reads"].get(attr_name)
+            if locs is not None:
+                hits_i: set[int] = set()
+                for rel, ln, enc in locs:
+                    if enc < 0:
+                        self._attr_read_cache[attr_name] = None
+                        return None
+                    hits_i.update(self.line_map.get(rel, {}).get(str(ln), ()))
+                    hits_i.update(self.func_map.get(rel, {}).get(str(enc), ()))
+                res_i = hits_i if hits_i else None
+                self._attr_read_cache[attr_name] = res_i
+                return res_i
 
         hits: set[int] = set()
         srcs = self._ensure_sources()
@@ -392,9 +469,25 @@ class StaticAnalyzer:
         return res
 
 
-# ======================== IN-CONTAINER VERIFIER (RUNS IN FORKED CHILD) ========================
+# ======================== IN-CONTAINER VERIFIER (v3: warm parent + forked children) ========================
+#
+# The parent imports sqlglot, every sqlglot module and every test module once ("warm").  For each commit a
+# child is forked.  In mode A the child swaps the __code__ of the changed functions in place (cheap); in
+# mode B it drops every sqlglot/tests module and re-imports them with the patched sources.  Mode A is used
+# only when every change is inside function bodies, no changed line ran during the warm import, and the
+# live functions are found unambiguously.  A line monitor checks that each passing test really executed
+# the changed code whenever the coverage map says it does; otherwise the test is reported as failing.
+
+CO_OPTIMIZED = 0x0001
+DEBUG2 = os.environ.get("BLAST_DEBUG") == "2"
+IMPORT_LINES_PATH = Path("/app/import_lines.json.gz")
+
 
 class _SubTestFailFast(BaseException):
+    pass
+
+
+class _TestTimeout(BaseException):
     pass
 
 
@@ -495,215 +588,574 @@ def _lazy_wait(fs, timeout=None, return_when=concurrent.futures.ALL_COMPLETED):
     return set(fs_list), set()
 
 
-def _run_verification_child(
-    patched_files: dict[str, str],
-    test_ids: list[tuple[int, str]],
-    use_pickle: bool,
-) -> tuple[list[int], list[int]]:
-    signal.alarm(15)
+def _module_name_for(rel: str) -> tuple[str, bool] | None:
+    if not rel.endswith(".py"):
+        return None
+    if rel.endswith("/__init__.py"):
+        return rel[: -len("/__init__.py")].replace("/", "."), True
+    return rel[:-3].replace("/", "."), False
 
-    os.chdir(SQLGLOT_REAL)
-    os.environ["SKIP_INTEGRATION"] = "0"
-    if SQLGLOT_REAL not in sys.path:
-        sys.path.insert(0, SQLGLOT_REAL)
 
-    mod_map: dict[str, tuple[str, str, bool]] = {}
-    abs_patches: dict[str, str] = {}
-    for rel, content in patched_files.items():
-        abs_p = os.path.realpath(os.path.join(SQLGLOT_REAL, rel))
-        abs_patches[abs_p] = content
-        if rel.endswith(".py"):
-            if rel.endswith("/__init__.py"):
-                mod_name = rel[: -len("/__init__.py")].replace("/", ".")
-                is_pkg = True
-            else:
-                mod_name = rel[:-3].replace("/", ".")
-                is_pkg = False
-            mod_map[mod_name] = (content, abs_p, is_pkg)
+def _code_sig(co) -> tuple:
+    consts = []
+    for c in co.co_consts:
+        if hasattr(c, "co_code"):
+            consts.append(("<code>", c.co_name))
+        else:
+            consts.append((type(c).__name__, repr(c)))
+    return (
+        co.co_code, co.co_names, co.co_varnames, co.co_freevars, co.co_cellvars, tuple(consts),
+        co.co_flags, co.co_argcount, co.co_kwonlyargcount, co.co_posonlyargcount, co.co_name, co.co_qualname,
+    )
 
-    if mod_map:
-        sys.meta_path.insert(0, _PatchFinder(mod_map))
 
-    orig_open = builtins.open
-    orig_io_open = io.open
-    orig_path_open = Path.open
+def _children(co) -> list:
+    return [c for c in co.co_consts if hasattr(c, "co_code")]
 
-    def _patched_stream(target, mode="r", *args, **kwargs):
-        if any(m in mode for m in ("w", "a", "x", "+")):
-            return None
-        try:
-            s = os.fspath(target)
-            if isinstance(s, bytes):
-                s = s.decode("utf-8", errors="ignore")
-            rp = os.path.realpath(s)
-        except Exception:
-            return None
-        content = abs_patches.get(rp)
-        if content is None:
-            return None
-        if "b" in mode:
-            return io.BytesIO(content.encode("utf-8"))
-        return io.StringIO(content)
 
-    def wrapped_open(file, mode="r", *args, **kwargs):
-        stream = _patched_stream(file, mode)
-        if stream is not None:
-            return stream
-        return orig_open(file, mode, *args, **kwargs)
+def _subtree_equal(a, b) -> bool:
+    if _code_sig(a) != _code_sig(b):
+        return False
+    ca, cb = _children(a), _children(b)
+    return len(ca) == len(cb) and all(_subtree_equal(x, y) for x, y in zip(ca, cb))
 
-    def wrapped_io_open(file, mode="r", *args, **kwargs):
-        stream = _patched_stream(file, mode)
-        if stream is not None:
-            return stream
-        return orig_io_open(file, mode, *args, **kwargs)
 
-    def wrapped_path_open(self, mode="r", *args, **kwargs):
-        stream = _patched_stream(self, mode)
-        if stream is not None:
-            return stream
-        return orig_path_open(self, mode, *args, **kwargs)
+def diff_code_trees(old_mod, new_mod) -> list[tuple] | None:
+    """Pairs (old_top_func_code, new_top_func_code) whose subtree changed, or None when anything outside a
+    function body changed (module code, class bodies, defaults, decorators...)."""
+    changed: list[tuple] = []
 
-    builtins.open = wrapped_open
-    io.open = wrapped_io_open
-    Path.open = wrapped_path_open
+    def walk(a, b) -> bool:
+        is_func = bool(a.co_flags & CO_OPTIMIZED)
+        if is_func:
+            if not _subtree_equal(a, b):
+                # pair this function and every nested code object (closures made at import time are live
+                # function objects of the nested code and must be swapped too)
+                return pair(a, b, True)
+            return True
+        if _code_sig(a) != _code_sig(b):
+            return False
+        ca, cb = _children(a), _children(b)
+        if len(ca) != len(cb):
+            return False
+        return all(walk(x, y) for x, y in zip(ca, cb))
 
-    class _ConfiguredExec(_LazyImmediateExecutor):
-        def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
-            super().__init__(max_workers, mp_context, initializer, initargs, use_pickle=use_pickle)
-
-    concurrent.futures.ProcessPoolExecutor = _ConfiguredExec
-    concurrent.futures.as_completed = _lazy_as_completed
-    concurrent.futures.wait = _lazy_wait
-
-    @contextlib.contextmanager
-    def fast_subtest(self, msg=None, **params):
-        try:
-            yield
-        except unittest.SkipTest:
+    def pair(a, b, top: bool) -> bool:
+        if a.co_freevars != b.co_freevars or a.co_name != b.co_name or a.co_qualname != b.co_qualname:
+            return False
+        if a.co_firstlineno != b.co_firstlineno and not top:
             pass
-        except BaseException:
-            raise _SubTestFailFast()
+        ca, cb = _children(a), _children(b)
+        if len(ca) != len(cb):
+            return False
+        if top or not _subtree_equal(a, b):
+            changed.append((a, b, top))
+        return all(pair(x, y, False) for x, y in zip(ca, cb))
 
-    unittest.TestCase.subTest = fast_subtest
+    def _unused(a, b) -> bool:
+        is_func = bool(a.co_flags & CO_OPTIMIZED)
+        if is_func:
+            return True
+        if _code_sig(a) != _code_sig(b):
+            return False
+        ca, cb = _children(a), _children(b)
+        if len(ca) != len(cb):
+            return False
+        return all(walk(x, y) for x, y in zip(ca, cb))
 
-    devnull = open(os.devnull, "w")
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout = devnull
-    sys.stderr = devnull
+    if not walk(old_mod, new_mod):
+        return None
+    return changed
 
-    passed: list[int] = []
-    failed: list[int] = []
-    loaded_classes: dict[tuple[str, str], type | None] = {}
-    setup_done: set[tuple[str, str]] = set()
 
-    grouped: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
-    for num, tid in test_ids:
-        parts = tid.split("::")
-        if len(parts) != 3:
-            failed.append(num)
-            continue
-        grouped[(parts[0], parts[1])].append((num, parts[2]))
-
-    try:
-        for (mod_file, cls_name), methods in grouped.items():
-            key = (mod_file, cls_name)
-            if key not in loaded_classes:
-                mod_name = mod_file[:-3].replace("/", ".")
-                try:
-                    mod = __import__(mod_name, fromlist=[cls_name])
-                    cls = getattr(mod, cls_name)
-                    loaded_classes[key] = cls
-                except BaseException:
-                    loaded_classes[key] = None
-
-            cls = loaded_classes[key]
-            if cls is None:
-                for num, _ in methods:
-                    failed.append(num)
+def _new_changed_lines(hunks: list) -> set[int]:
+    """New-file line numbers of added lines (or the insertion point of a pure deletion)."""
+    out: set[int] = set()
+    for _os, _oc, new_start, _nc, hunk_lines in hunks:
+        ln = new_start
+        pending_del = False
+        for hl in hunk_lines:
+            if hl.startswith("\\"):
                 continue
+            tag = hl[0]
+            if tag == "+":
+                out.add(ln)
+                ln += 1
+                pending_del = False
+            elif tag == "-":
+                pending_del = True
+            else:
+                if pending_del:
+                    out.add(ln)
+                    out.add(max(1, ln - 1))
+                pending_del = False
+                ln += 1
+        if pending_del:
+            out.add(max(1, ln - 1))
+    return out
 
-            if key not in setup_done:
-                setup_done.add(key)
-                if hasattr(cls, "setUpClass"):
-                    try:
-                        cls.setUpClass()
-                    except BaseException:
-                        for num, _ in methods:
-                            failed.append(num)
-                        loaded_classes[key] = None
-                        continue
 
-            for num, meth_name in methods:
+def _all_codes(co) -> list:
+    res = [co]
+    for c in _children(co):
+        res.extend(_all_codes(c))
+    return res
+
+
+class WarmRunner:
+    def __init__(self, debug: bool = False) -> None:
+        self.ready = False
+        self.debug = debug
+        self.func_index: dict[tuple[str, str, int], list] = {}
+        self.import_opened: set[str] = set()
+        self.import_lines: dict[str, set[int]] = {}
+        self.warm_failed = False
+        self.exec_setup_done = False
+        self.exec_setup_failed = False
+        self.setup_lines: dict[str, set[int]] = {}
+        self.last_cpu = 0.0
+        self.why = ""
+
+    # ---------------------------------------------------------------- warmup
+    def warm(self) -> None:
+        if self.ready or self.warm_failed:
+            return
+        try:
+            self._warm()
+            self.ready = True
+        except BaseException as e:  # pragma: no cover
+            self.warm_failed = True
+            print(f"warmup failed: {e!r}", file=sys.stderr)
+
+    def _warm(self) -> None:
+        os.chdir(SQLGLOT_REAL)
+        os.environ["SKIP_INTEGRATION"] = "0"
+        if SQLGLOT_REAL not in sys.path:
+            sys.path.insert(0, SQLGLOT_REAL)
+        try:
+            with gzip.open(IMPORT_LINES_PATH, "rt", encoding="utf-8") as gz:
+                self.import_lines = {f: set(ls) for f, ls in json.load(gz).items()}
+        except Exception:
+            self.import_lines = {}
+            self.no_import_lines = True
+
+        orig_open = builtins.open
+        orig_io_open = io.open
+        orig_path_open = Path.open
+        opened = self.import_opened
+
+        def rec(target):
+            try:
+                s = os.fspath(target)
+                if isinstance(s, bytes):
+                    s = s.decode("utf-8", "ignore")
+                rp = os.path.realpath(s)
+                if rp.startswith(SQLGLOT_REAL + "/"):
+                    opened.add(rp[len(SQLGLOT_REAL) + 1:])
+            except Exception:
+                pass
+
+        def w_open(file, *a, **k):
+            rec(file)
+            return orig_open(file, *a, **k)
+
+        def w_io_open(file, *a, **k):
+            rec(file)
+            return orig_io_open(file, *a, **k)
+
+        def w_path_open(self_, *a, **k):
+            rec(self_)
+            return orig_path_open(self_, *a, **k)
+
+        builtins.open, io.open, Path.open = w_open, w_io_open, w_path_open
+        devnull = orig_open(os.devnull, "w")
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = devnull
+        try:
+            for p in sorted((SQLGLOT / "sqlglot").rglob("*.py")):
+                rel = str(p.relative_to(SQLGLOT))
+                if "__pycache__" in rel or rel.endswith("__main__.py"):
+                    continue
+                mn = _module_name_for(rel)
+                if mn is None:
+                    continue
                 try:
-                    inst = cls(meth_name)
-                    res = unittest.TestResult()
-                    inst.run(res)
-                    if res.wasSuccessful() and not res.skipped:
-                        passed.append(num)
-                    else:
-                        failed.append(num)
-                except _SubTestFailFast:
-                    failed.append(num)
-                except BaseException:
-                    failed.append(num)
-    finally:
-        for key in setup_done:
-            cls = loaded_classes.get(key)
-            if cls is not None and hasattr(cls, "tearDownClass"):
-                try:
-                    cls.tearDownClass()
+                    __import__(mn[0])
                 except BaseException:
                     pass
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        devnull.close()
+            for p in sorted((SQLGLOT / "tests").rglob("test_*.py")):
+                rel = str(p.relative_to(SQLGLOT))
+                if rel in NEVER_VERIFY_FILES:
+                    continue
+                try:
+                    __import__(rel[:-3].replace("/", "."))
+                except BaseException:
+                    pass
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            devnull.close()
+            builtins.open, io.open, Path.open = orig_open, orig_io_open, orig_path_open
 
-    return passed, failed
+        import gc
+        import types
+        prefix = SQLGLOT_REAL + "/sqlglot/"
+        idx: dict[tuple[str, str, int], list] = defaultdict(list)
+        for o in gc.get_objects():
+            if type(o) is types.FunctionType:
+                co = o.__code__
+                if co.co_filename.startswith(prefix):
+                    idx[(co.co_filename, co.co_qualname, co.co_firstlineno)].append(o)
+        self.func_index = dict(idx)
 
-
-def verify_in_fork(
-    patched_files: dict[str, str],
-    test_ids: list[tuple[int, str]],
-    use_pickle: bool,
-) -> tuple[set[int], set[int]]:
-    r_fd, w_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(r_fd)
+    def ensure_exec_setup(self) -> None:
+        """Run TestExecutor.setUpClass once in the warm parent (CSV loading, ~2 s) and record which sqlglot
+        lines it executed; mode-A children then reuse the loaded tables."""
+        if self.exec_setup_done or self.exec_setup_failed or not self.ready:
+            return
+        T = 5
+        mon = sys.monitoring
+        lines: dict[str, set[int]] = {}
+        P = SQLGLOT_REAL + "/sqlglot/"
         try:
-            passed, failed = _run_verification_child(patched_files, test_ids, use_pickle)
-            payload = json.dumps({"p": passed, "f": failed}).encode("utf-8")
-            with os.fdopen(w_fd, "wb") as wf:
-                wf.write(payload)
-        except BaseException:
+            mod = sys.modules.get("tests.test_executor") or __import__("tests.test_executor", fromlist=["TestExecutor"])
+            cls = mod.TestExecutor
+
+            def on_line(code, ln):
+                f = code.co_filename
+                if f.startswith(P):
+                    lines.setdefault(f[len(SQLGLOT_REAL) + 1:], set()).add(ln)
+                return mon.DISABLE
+
+            mon.use_tool_id(T, "br_setup")
+            mon.register_callback(T, mon.events.LINE, on_line)
+            mon.set_events(T, mon.events.LINE)
+            devnull = open(os.devnull, "w")
+            old_out, old_err = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = devnull
             try:
-                os.close(w_fd)
-            except OSError:
+                cls.setUpClass()
+            finally:
+                sys.stdout, sys.stderr = old_out, old_err
+                devnull.close()
+                mon.set_events(T, 0)
+                mon.register_callback(T, mon.events.LINE, None)
+                mon.free_tool_id(T)
+            self.setup_lines = lines
+            self.exec_setup_done = True
+        except BaseException as e:
+            self.exec_setup_failed = True
+            print(f"exec setup failed: {e!r}", file=sys.stderr)
+
+    def exec_setup_conflict(self, touched: dict) -> bool:
+        if not self.exec_setup_done:
+            return False
+        for rel, info in touched.items():
+            if not rel.endswith(".py"):
+                return True
+            if info["old_lines"] & self.setup_lines.get(rel, set()):
+                return True
+        return False
+
+    # ---------------------------------------------------------------- planning
+    def plan_mode_a(self, touched: dict, patched_contents: dict[str, str]) -> list | None:
+        """Returns a list of swaps [(funcs, new_code, codes_to_monitor)] or None if mode A is unsafe."""
+        if not self.ready or not self.import_lines:
+            return None
+        swaps = []
+        for rel, info in touched.items():
+            if not rel.endswith(".py"):
+                if rel in self.import_opened:
+                    return None
+                continue
+            if not rel.startswith("sqlglot/"):
+                return None
+            new_src = patched_contents.get(rel)
+            if new_src is None:
+                return None
+            abs_p = os.path.realpath(os.path.join(SQLGLOT_REAL, rel))
+            try:
+                old_src = (SQLGLOT / rel).read_text("utf-8")
+                old_code = compile(old_src, abs_p, "exec", dont_inherit=True)
+                new_code = compile(new_src, abs_p, "exec", dont_inherit=True)
+            except SyntaxError:
+                return None
+            changed = diff_code_trees(old_code, new_code)
+            if changed is None:
+                self.why = f"non-body change {rel}"
+                return None
+            imp = self.import_lines.get(rel, set())
+            if info["old_lines"] & imp:
+                self.why = f"import-line {rel}"
+                return None
+            for oc, nc, top in changed:
+                funcs = self.func_index.get((abs_p, oc.co_qualname, oc.co_firstlineno))
+                if not funcs:
+                    if not top:
+                        continue
+                    self.why = f"no live func {oc.co_qualname}"
+                    return None
+                live_codes = {id(f.__code__): f.__code__ for f in funcs}
+                if len(live_codes) != 1:
+                    return None
+                live = next(iter(live_codes.values()))
+                if not _subtree_equal(live, oc):
+                    return None
+                for f in funcs:
+                    if len(f.__code__.co_freevars) != len(nc.co_freevars):
+                        return None
+                swaps.append((rel, funcs, nc))
+        return swaps
+
+    # ---------------------------------------------------------------- running
+    def verify(self, mode: str, swaps, patched_files: dict[str, str], test_ids: list[tuple[int, str, float]],
+               guard: dict[int, bool], new_lines: dict[str, set[int]], use_pickle: bool, budget_s: float) -> tuple[set[int], set[int]]:
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r_fd)
+            try:
+                passed, failed = self._child(mode, swaps, patched_files, test_ids, guard, new_lines, use_pickle, budget_s)
+                payload = json.dumps({"p": passed, "f": failed}).encode("utf-8")
+                with os.fdopen(w_fd, "wb") as wf:
+                    wf.write(payload)
+            except BaseException:
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
+            os._exit(0)
+        os.close(w_fd)
+        chunks = []
+        with os.fdopen(r_fd, "rb") as rf:
+            while True:
+                chunk = rf.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        _pid, _st, ru = os.wait4(pid, 0)
+        self.last_cpu = ru.ru_utime + ru.ru_stime
+        raw = b"".join(chunks)
+        allnums = {n for n, _, _ in test_ids}
+        if not raw:
+            return set(), allnums
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            p = set(data["p"]) & allnums
+            return p, allnums - p
+        except Exception:
+            return set(), allnums
+
+    def _child(self, mode, swaps, patched_files, test_ids, guard, new_lines, use_pickle, budget_s):
+        try:
+            pass  # no address-space limit: numpy reserves large virtual areas
+        except Exception:
+            pass
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.alarm(max(5, int(budget_s) + 3))
+
+        abs_patches: dict[str, str] = {}
+        for rel, content in patched_files.items():
+            abs_patches[os.path.realpath(os.path.join(SQLGLOT_REAL, rel))] = content
+
+        executed: set[tuple[str, int]] = set()
+        mon = sys.monitoring
+        TOOL = 4
+
+        if mode == "A":
+            mon.use_tool_id(TOOL, "br_guard")
+            code_file: dict[int, str] = {}
+
+            def on_line(code, line):
+                executed.add((code_file.get(id(code), ""), line))
+                return mon.DISABLE
+
+            mon.register_callback(TOOL, mon.events.LINE, on_line)
+            for rel, funcs, nc in swaps:
+                for f in funcs:
+                    f.__code__ = nc
+                for c in _all_codes(nc):
+                    code_file[id(c)] = rel
+                    mon.set_local_events(TOOL, c, mon.events.LINE)
+        else:
+            for name in list(sys.modules):
+                if name == "sqlglot" or name.startswith("sqlglot.") or name == "tests" or name.startswith("tests."):
+                    del sys.modules[name]
+            mod_map: dict[str, tuple[str, str, bool]] = {}
+            for rel, content in patched_files.items():
+                mn = _module_name_for(rel)
+                if mn:
+                    mod_map[mn[0]] = (content, os.path.realpath(os.path.join(SQLGLOT_REAL, rel)), mn[1])
+            if mod_map:
+                sys.meta_path.insert(0, _PatchFinder(mod_map))
+            importlib.invalidate_caches()
+
+        orig_open = builtins.open
+        orig_io_open = io.open
+        orig_path_open = Path.open
+
+        def _patched_stream(target, mode_="r"):
+            if any(m in mode_ for m in ("w", "a", "x", "+")):
+                return None
+            try:
+                s = os.fspath(target)
+                if isinstance(s, bytes):
+                    s = s.decode("utf-8", errors="ignore")
+                rp = os.path.realpath(s)
+            except Exception:
+                return None
+            content = abs_patches.get(rp)
+            if content is None:
+                return None
+            if "b" in mode_:
+                return io.BytesIO(content.encode("utf-8"))
+            return io.StringIO(content)
+
+        def wrapped_open(file, mode_="r", *args, **kwargs):
+            st = _patched_stream(file, mode_)
+            return st if st is not None else orig_open(file, mode_, *args, **kwargs)
+
+        def wrapped_io_open(file, mode_="r", *args, **kwargs):
+            st = _patched_stream(file, mode_)
+            return st if st is not None else orig_io_open(file, mode_, *args, **kwargs)
+
+        def wrapped_path_open(self_, mode_="r", *args, **kwargs):
+            st = _patched_stream(self_, mode_)
+            return st if st is not None else orig_path_open(self_, mode_, *args, **kwargs)
+
+        if abs_patches:
+            builtins.open = wrapped_open
+            io.open = wrapped_io_open
+            Path.open = wrapped_path_open
+
+        class _ConfiguredExec(_LazyImmediateExecutor):
+            def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
+                super().__init__(max_workers, mp_context, initializer, initargs, use_pickle=use_pickle)
+
+        repl = {
+            "ProcessPoolExecutor": (concurrent.futures.ProcessPoolExecutor, _ConfiguredExec),
+            "as_completed": (concurrent.futures.as_completed, _lazy_as_completed),
+            "wait": (concurrent.futures.wait, _lazy_wait),
+        }
+        for attr, (_orig, new) in repl.items():
+            setattr(concurrent.futures, attr, new)
+        # test modules imported by the warm parent hold their own references
+        for mname, m in list(sys.modules.items()):
+            if m is None or not (mname == "tests" or mname.startswith("tests.")):
+                continue
+            for attr, (orig, new) in repl.items():
+                if getattr(m, attr, None) is orig:
+                    setattr(m, attr, new)
+
+        @contextlib.contextmanager
+        def fast_subtest(self, msg=None, **params):
+            try:
+                yield
+            except unittest.SkipTest:
                 pass
-        os._exit(0)
+            except _TestTimeout:
+                raise
+            except BaseException:
+                raise _SubTestFailFast()
 
-    os.close(w_fd)
-    chunks = []
-    with os.fdopen(r_fd, "rb") as rf:
-        while True:
-            chunk = rf.read(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    os.waitpid(pid, 0)
+        unittest.TestCase.subTest = fast_subtest
 
-    raw = b"".join(chunks)
-    if not raw:
-        return set(), {n for n, _ in test_ids}
-    try:
-        data = json.loads(raw.decode("utf-8"))
-        return set(data["p"]), set(data["f"])
-    except Exception:
-        return set(), {n for n, _ in test_ids}
+        def on_timeout(signum, frame):
+            raise _TestTimeout()
+
+        devnull = orig_open(os.devnull, "w")
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = devnull
+        sys.stderr = devnull
+
+        passed: list[int] = []
+        failed: list[int] = []
+        loaded_classes: dict[tuple[str, str], type | None] = {}
+        pre_setup: set[tuple[str, str]] = set()
+        if mode == "A" and self.exec_setup_done:
+            pre_setup.add(("tests/test_executor.py", "TestExecutor"))
+        setup_done: set[tuple[str, str]] = set(pre_setup)
+        grouped: dict[tuple[str, str], list[tuple[int, str, float]]] = defaultdict(list)
+        for num, tid, sec in test_ids:
+            parts = tid.split("::")
+            if len(parts) != 3:
+                failed.append(num)
+                continue
+            grouped[(parts[0], parts[1])].append((num, parts[2], sec))
+
+        try:
+            for (mod_file, cls_name), methods in grouped.items():
+                key = (mod_file, cls_name)
+                if key not in loaded_classes:
+                    mod_name = mod_file[:-3].replace("/", ".")
+                    try:
+                        mod = __import__(mod_name, fromlist=[cls_name])
+                        loaded_classes[key] = getattr(mod, cls_name)
+                    except BaseException:
+                        loaded_classes[key] = None
+                cls = loaded_classes[key]
+                if cls is None:
+                    failed.extend(n for n, _, _ in methods)
+                    continue
+                if DEBUG2:
+                    r_ = resource.getrusage(resource.RUSAGE_SELF)
+                    print(f"    cls {cls_name} loaded cpu={r_.ru_utime + r_.ru_stime:.3f}", file=sys.__stderr__)
+                if key not in setup_done:
+                    setup_done.add(key)
+                    if hasattr(cls, "setUpClass"):
+                        try:
+                            cls.setUpClass()
+                        except BaseException:
+                            failed.extend(n for n, _, _ in methods)
+                            loaded_classes[key] = None
+                            continue
+                for num, meth_name, sec in methods:
+                    if mode == "A":
+                        executed.clear()
+                        mon.set_events(TOOL, 0)
+                        mon.restart_events()
+                    ok = False
+                    old_h = signal.signal(signal.SIGALRM, on_timeout)
+                    signal.setitimer(signal.ITIMER_REAL, max(2.0, sec * 4 + 1.0))
+                    try:
+                        inst = cls(meth_name)
+                        res = unittest.TestResult()
+                        inst.run(res)
+                        ok = res.wasSuccessful() and not res.skipped
+                    except BaseException:
+                        ok = False
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                        signal.signal(signal.SIGALRM, old_h)
+                    if ok and mode == "A" and guard.get(num):
+                        hit = any((f, ln) in executed for f, lns in new_lines.items() for ln in lns)
+                        if not hit:
+                            ok = False
+                            if DEBUG2:
+                                print(f"    guard-fail {num} {cls_name}.{meth_name}", file=sys.__stderr__)
+                    elif not ok and DEBUG2:
+                        print(f"    fail {num} {cls_name}.{meth_name} {res.failures[:1] or res.errors[:1] if 'res' in dir() else ''}"[:600], file=sys.__stderr__)
+                    if DEBUG2:
+                        r_ = resource.getrusage(resource.RUSAGE_SELF)
+                        print(f"    t {num} {cls_name}.{meth_name} ok={ok} cpu={r_.ru_utime + r_.ru_stime:.3f} rec={sec}", file=sys.__stderr__)
+                    (passed if ok else failed).append(num)
+        finally:
+            for key in setup_done - pre_setup:
+                cls = loaded_classes.get(key)
+                if cls is not None and hasattr(cls, "tearDownClass"):
+                    try:
+                        cls.tearDownClass()
+                    except BaseException:
+                        pass
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            devnull.close()
+        return passed, failed
 
 
-def estimate_verify_cpu_ms(test_nums: set[int], t_by_num: dict[int, dict]) -> int:
-    total = 280.0
+def estimate_verify_cpu_ms(test_nums, t_by_num: dict[int, dict], mode: str, warm_ready: bool) -> int:
+    total = 30.0 if mode == "A" else 900.0
+    if not warm_ready:
+        total += 3500.0
     files_seen: set[str] = set()
     for n in test_nums:
         t = t_by_num[n]
@@ -712,11 +1164,11 @@ def estimate_verify_cpu_ms(test_nums: set[int], t_by_num: dict[int, dict]) -> in
         if tf not in files_seen:
             files_seen.add(tf)
             if tf == "tests/test_executor.py":
-                total += 1600.0
-            elif tf == "tests/test_optimizer.py":
-                total += 600.0
+                total += 1200.0
+            elif mode == "B":
+                total += 60.0
             else:
-                total += 35.0
+                total += 5.0
         if tf == "tests/test_optimizer.py":
             total += rec_ms * 1.15
         elif tf == "tests/test_executor.py":
@@ -728,8 +1180,103 @@ def estimate_verify_cpu_ms(test_nums: set[int], t_by_num: dict[int, dict]) -> in
     return int(total)
 
 
+
+# ======================== COMPARISON-PROFILE PRUNING ========================
+# cmp_profile.json.gz maps "file|line|col|op|alt" -> tests that executed that comparison (under two hash
+# seeds) and for which the alternative operator never gave a different result.  When a change only swaps
+# comparison operators, such tests execute exactly as before and cannot fail.
+
+CMP_PROFILE_PATH = Path("/app/cmp_profile.json.gz")
+_CMP_OPS = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Is: "is", ast.IsNot: "is not"}
+_cmp_profile_cache: list = []
+
+
+def load_cmp_profile() -> dict:
+    if not _cmp_profile_cache:
+        try:
+            with gzip.open(CMP_PROFILE_PATH, "rt", encoding="utf-8") as g:
+                _cmp_profile_cache.append(json.load(g))
+        except Exception:
+            _cmp_profile_cache.append({})
+    return _cmp_profile_cache[0]
+
+
+def _prim_fields(node) -> tuple:
+    out = []
+    for name, val in ast.iter_fields(node):
+        if isinstance(val, ast.AST):
+            continue
+        if isinstance(val, list):
+            out.append((name, len(val), tuple(type(v).__name__ for v in val if not isinstance(v, ast.AST))))
+            continue
+        out.append((name, type(val).__name__, repr(val)))
+    return tuple(out)
+
+
+def compare_only_changes(old_src: str, new_src: str) -> list[tuple[int, int, str, str]] | None:
+    """[(line, col, old_op, new_op)] when the two sources differ only in single-operator comparisons."""
+    try:
+        a = ast.parse(old_src)
+        b = ast.parse(new_src)
+    except SyntaxError:
+        return None
+    wa, wb = list(ast.walk(a)), list(ast.walk(b))
+    if len(wa) != len(wb):
+        return None
+    changes = []
+    for x, y in zip(wa, wb):
+        if type(x) is not type(y):
+            if isinstance(x, ast.cmpop) and isinstance(y, ast.cmpop):
+                continue  # handled at the Compare node
+            return None
+        if isinstance(x, ast.Compare):
+            if len(x.ops) != len(y.ops):
+                return None
+            if [type(o) for o in x.ops] != [type(o) for o in y.ops]:
+                if len(x.ops) != 1 or type(x.ops[0]) not in _CMP_OPS or type(y.ops[0]) not in _CMP_OPS:
+                    return None
+                changes.append((x.lineno, x.col_offset, _CMP_OPS[type(x.ops[0])], _CMP_OPS[type(y.ops[0])]))
+            continue
+        if isinstance(x, ast.cmpop):
+            continue
+        if _prim_fields(x) != _prim_fields(y):
+            return None
+    return changes
+
+
+def removed_old_lines(hunks: list) -> set[int]:
+    out: set[int] = set()
+    for old_start, _oc, _ns, _nc, hunk_lines in hunks:
+        ln = old_start
+        for hl in hunk_lines:
+            if hl.startswith("\\"):
+                continue
+            if hl[0] == "-":
+                out.add(ln)
+                ln += 1
+            elif hl[0] == "+":
+                pass
+            else:
+                ln += 1
+    return out
+
+
+def verify_overhead_ms(ver, t_by_num, mode: str, runner) -> int:
+    files = {t_by_num[n]["file"] for n in ver}
+    has_exec = "tests/test_executor.py" in files
+    if mode == "A":
+        total = 20
+        if has_exec and not runner.exec_setup_done:
+            total += 2200
+    else:
+        total = 900 + 45 * len(files)
+        if has_exec:
+            total += 2200
+    return total
+
+
 def main() -> None:
-    debug = os.environ.get("BLAST_DEBUG") == "1"
+    debug = os.environ.get("BLAST_DEBUG") in ("1", "2")
 
     tests_json = json.loads((DATA / "tests.json").read_text("utf-8"))
     tests = tests_json["tests"]
@@ -744,6 +1291,23 @@ def main() -> None:
         cov = json.load(gz)
 
     analyzer = StaticAnalyzer(cov)
+    runner = WarmRunner(debug)
+    try:
+        with gzip.open(IMPORT_LINES_PATH, "rt", encoding="utf-8") as _gz:
+            import_lines_all = {f: set(ls) for f, ls in json.load(_gz).items()}
+    except Exception:
+        import_lines_all = {}
+    try:
+        _tc = json.loads(Path("/app/test_costs.json").read_text("utf-8"))
+        cost_table = {int(k): v for k, v in _tc["tests"].items()}
+    except Exception:
+        cost_table = {}
+
+    def vcost_ms(n: int) -> int:
+        c = cost_table.get(n)
+        if c is None:
+            c = int(t_by_num[n]["seconds"] * 1700) + 5
+        return c + 2
 
     core_files = {
         "sqlglot/__init__.py",
@@ -946,40 +1510,106 @@ def main() -> None:
         if fallback_all:
             selected = set(all_test_nums)
 
+        # comparison-operator swaps: drop tests that provably see identical results
+        if selected and not fallback_all and patch_clean:
+            cmp_safe: set[int] | None = None
+            for rel, info in touched.items():
+                if not rel.endswith(".py") or rel not in patched_contents or not rel.startswith("sqlglot/"):
+                    cmp_safe = None
+                    break
+                old_src = (SQLGLOT / rel).read_text("utf-8", errors="replace")
+                new_src = patched_contents[rel]
+                chg = compare_only_changes(old_src, new_src)
+                if chg is None:
+                    cmp_safe = None
+                    break
+                if not chg:
+                    continue
+                prof = load_cmp_profile()
+                imp = import_lines_all.get(rel, set())
+                for line, col, op_old, op_new in chg:
+                    if line in imp:
+                        cmp_safe = set()
+                        break
+                    s = set(prof.get(f"{rel}|{line}|{col}|{op_old}|{op_new}", ()))
+                    cmp_safe = s if cmp_safe is None else (cmp_safe & s)
+                if cmp_safe is not None and not cmp_safe:
+                    break
+            if cmp_safe:
+                before = len(selected)
+                selected -= cmp_safe
+                if debug:
+                    print(f"  {commit_id}: cmp-profile pruned {before - len(selected)}", file=sys.stderr)
+
         verified_flag = False
+        mode_used = "-"
         orig_count = len(selected)
-        if (
-            selected
-            and not fallback_all
-            and patch_clean
-            and patched_contents
-            and has_py_semantic_change
-        ):
+        if selected and not fallback_all and patch_clean and patched_contents and has_py_semantic_change:
             kept_heavy = {
                 n for n in selected
                 if t_by_num[n]["id"] in NEVER_VERIFY_IDS
                 or t_by_num[n]["file"] in NEVER_VERIFY_FILES
-                or (dur_by_num[n] > 4000 and t_by_num[n]["id"] != "tests/test_generator.py::TestGenerator::test_generator_memory")
+                or vcost_ms(n) > 6000
             }
             verifiable = selected - kept_heavy
-
-            if verifiable and len(verifiable) <= 180:
+            if verifiable:
                 _, full_sim_ms = pack_workers(selected, dur_by_num)
                 _, heavy_sim_ms = pack_workers(kept_heavy, dur_by_num)
-                max_savings_ms = full_sim_ms - heavy_sim_ms
-                est_cpu_ms = estimate_verify_cpu_ms(verifiable, t_by_num)
-
-                if max_savings_ms >= est_cpu_ms * 1.15 and max_savings_ms >= 1500:
-                    verified_flag = True
-                    test_id_list = [(n, t_by_num[n]["id"]) for n in sorted(verifiable, key=lambda x: dur_by_num[x])]
-                    passed_set, _failed_set = verify_in_fork(patched_contents, test_id_list, touched_serde)
-                    selected = selected - passed_set
+                if full_sim_ms - heavy_sim_ms >= 300:
+                    runner.warm()
+                if runner.ready and full_sim_ms - heavy_sim_ms >= 300:
+                    swaps = runner.plan_mode_a(touched, patched_contents)
+                    mode = "A" if swaps is not None else "B"
+                    # choose which light tests to verify: drop the ones whose verification costs much more
+                    # than their share of the packed output
+                    order = sorted(verifiable, key=lambda n: vcost_ms(n) - dur_by_num[n], reverse=True)
+                    best = (full_sim_ms, None)
+                    for k in range(0, min(6, len(order)) + 1):
+                        keep = set(order[:k])
+                        ver = verifiable - keep
+                        if not ver:
+                            break
+                        est = verify_overhead_ms(ver, t_by_num, mode, runner) + sum(vcost_ms(n) for n in ver)
+                        _, out_ms = pack_workers(kept_heavy | keep, dur_by_num)
+                        if est + out_ms < best[0]:
+                            best = (est + out_ms, ver, est)
+                    if debug:
+                        print(f"  {commit_id}: full={full_sim_ms} best={best[0]} mode={mode} why={getattr(runner, 'why', '')} nver={len(verifiable)} heavy={sorted(kept_heavy)}", file=sys.stderr)
+                    runner.why = ""
+                    if best[1] is not None and best[0] < full_sim_ms - 150:
+                        ver = best[1]
+                        est_cpu_ms = best[2]
+                        if mode == "A" and any(t_by_num[n]["file"] == "tests/test_executor.py" for n in ver):
+                            runner.ensure_exec_setup()
+                            if runner.exec_setup_conflict(touched):
+                                mode = "B"
+                                swaps = None
+                        guard: dict[int, bool] = {}
+                        new_lines: dict[str, set[int]] = {}
+                        if mode == "A":
+                            for rel, info in touched.items():
+                                if not rel.endswith(".py"):
+                                    continue
+                                new_lines[rel] = _new_changed_lines(info["hunks"])
+                                rem = removed_old_lines(info["hunks"]) or info["old_lines"]
+                                lm = analyzer.line_map.get(rel, {})
+                                for ln in rem:
+                                    for tnum in lm.get(str(ln), ()):
+                                        guard[tnum] = True
+                        verified_flag = True
+                        mode_used = mode
+                        test_id_list = [(n, t_by_num[n]["id"], t_by_num[n]["seconds"]) for n in sorted(ver, key=lambda x: (t_by_num[x]["file"], dur_by_num[x]))]
+                        budget = est_cpu_ms / 1000.0 * 3 + 8
+                        passed_set, _failed_set = runner.verify(mode, swaps, patched_contents, test_id_list, guard, new_lines, touched_serde, budget)
+                        selected = selected - passed_set
+                        if debug:
+                            print(f"  {commit_id}: verify cpu={runner.last_cpu:.3f}s est={est_cpu_ms/1000:.3f}s passed={len(passed_set)}/{len(ver)}", file=sys.stderr)
 
         workers, final_cost_ms = pack_workers(selected, dur_by_num)
         if debug:
             print(
                 f"DEBUG {commit_id}: orig={orig_count:3d} -> final={len(selected):3d} "
-                f"verified={str(verified_flag):<5} sim={final_cost_ms/1000.0:6.3f}s",
+                f"verified={str(verified_flag):<5} mode={mode_used} sim={final_cost_ms/1000.0:6.3f}s",
                 file=sys.stderr,
             )
         print(json.dumps({"commit": commit_id, "workers": workers}))
@@ -992,4 +1622,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--build-index"]:
+        build_attr_index()
+    else:
+        main()

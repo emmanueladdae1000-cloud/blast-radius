@@ -24,3 +24,6 @@ check_v2_cpu.py
 check_safety.py
 __pycache__/
 *.pyc
+dev/
+ana.py
+run.err
