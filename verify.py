@@ -452,6 +452,7 @@ def tpcds_code_probe(src_root, files, qidx, deadline, log):
     if not qidx:
         return True
     out = os.path.join("/tmp", f"tpc_{os.getpid()}.json")
+    rows = _tpcds_rows(src_root, log)
     pid = os.fork()
     if pid == 0:
         code = 1
@@ -461,11 +462,15 @@ def tpcds_code_probe(src_root, files, qidx, deadline, log):
             for name in list(sys.modules):
                 if name in ("sqlglot", "tests") or name.startswith(("sqlglot.", "tests.")):
                     del sys.modules[name]
+            import resource as _r
+            _c = lambda: _r.getrusage(_r.RUSAGE_SELF).ru_utime + _r.getrusage(_r.RUSAGE_SELF).ru_stime
+            tt = [_c()]
             _setup(src_root)
             mods = _install_finder(src_root, files)
             _import_patched(mods)
             from sqlglot import parse_one
             import tests.test_executor as te
+            tt.append(_c())
             for rel in files:  # refuse to report a pass unless the patched source is the one loaded
                 m = sys.modules.get(rel[:-3].replace("/", ".").removesuffix(".__init__"))
                 if m is None or getattr(m, "__spec__", None) is None or type(m.__spec__.loader).__name__ != "Loader":
@@ -474,8 +479,13 @@ def tpcds_code_probe(src_root, files, qidx, deadline, log):
             def rt(x):
                 return pickle.loads(pickle.dumps(x))
 
-            te.TestExecutor.setUpClass()
-            te.initializer(*rt((te.TPCDS_SCHEMA, te.TestExecutor.tpcds_tables)))
+            if rows is not None:
+                _tpcds_fast_setup(te, rows)
+                te.initializer(te.TPCDS_SCHEMA, te.TestExecutor.tpcds_tables)  # tables built on first use
+            else:
+                te.TestExecutor.setUpClass()
+                te.initializer(*rt((te.TPCDS_SCHEMA, te.TestExecutor.tpcds_tables)))
+            tt.append(_c())
             res = _Result()
             import cmpprune
             base_ms = (cmpprune._load("tpcds_lines.json.gz") or {}).get("ms") or []
@@ -511,8 +521,9 @@ def tpcds_code_probe(src_root, files, qidx, deadline, log):
 
             Probe().run(res)
             ok = not (state["slow"] or res.bad or res.failures or res.errors or res.skipped)
+            tt.append(_c())
             with open(out, "w") as fh:
-                json.dump({"ok": ok}, fh)
+                json.dump({"ok": ok, "t": [round(b - a, 3) for a, b in zip(tt, tt[1:])]}, fh)
             code = 0
         except BaseException:
             code = 1
@@ -520,14 +531,16 @@ def tpcds_code_probe(src_root, files, qidx, deadline, log):
             os._exit(code)
     st = _wait(pid, tmo)
     ok = False
+    steps = None
     if st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 and os.path.exists(out):
         with open(out) as fh:
-            ok = bool(json.load(fh).get("ok"))
+            d = json.load(fh)
+            ok, steps = bool(d.get("ok")), d.get("t")
     try:
         os.remove(out)
     except OSError:
         pass
-    log("tpcds-code-probe", len(qidx), "pass" if ok else "fail/unknown")
+    log("tpcds-code-probe", len(qidx), "pass" if ok else "fail/unknown", "cpu import/setup/queries", steps)
     return ok
 
 
@@ -797,3 +810,107 @@ def maxnodes_proxy(src_root, files, deadline, log, cap_s=4.0):
     r = _child_result(job, min(cap_s * 3 + 10, tmo), "mnp")
     log("maxnodes-proxy", r)
     return bool(r and r["ok"])
+
+
+_TPCDS_ROWS = {}
+
+
+def _tpcds_rows(src_root, log):
+    """TPC-DS table rows parsed from the CSV fixtures exactly as TestExecutor.setUpClass parses them
+    (no sqlglot involved), loaded once in this process and shared with forked probes."""
+    if "rows" in _TPCDS_ROWS:
+        return _TPCDS_ROWS["rows"]
+    try:
+        import ast as _ast
+        import csv
+        import gzip as _gz
+        if src_root not in sys.path:
+            sys.path.insert(0, src_root)
+        from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
+        d = FIXTURES_DIR + "/optimizer/tpc-ds/"
+        out = {}
+        for table in TPCDS_SCHEMA:
+            fn = f"{d}{table}.csv.gz"
+            with open(fn, "rb") as f:
+                gz = f.read(2) == b"\x1f\x8b"
+            fh = _gz.open(fn, "rt", newline="") if gz else open(fn, encoding="utf-8", newline="")
+            with fh:
+                reader = csv.reader(fh, delimiter="|")
+                next(reader)
+                rows, ctypes = [], []
+                for row in reader:
+                    if not ctypes:
+                        for v in row:
+                            try:
+                                ctypes.append(type(_ast.literal_eval(v)))
+                            except (ValueError, SyntaxError):
+                                ctypes.append(str)
+                    rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+            out[table] = rows
+        _TPCDS_ROWS["rows"] = out
+        try:
+            with _gz.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_expected.pkl.gz"), "rb") as g:
+                _TPCDS_ROWS["expected"] = pickle.load(g)
+        except BaseException as e:
+            log("tpcds expected load failed", repr(e))
+    except BaseException as e:
+        log("tpcds rows preload failed", repr(e))
+        _TPCDS_ROWS["rows"] = None
+    return _TPCDS_ROWS["rows"]
+
+
+def _tpcds_fast_setup(te, rows):
+    """TestExecutor.setUpClass for the TPC-DS half only, reusing pre-parsed rows: DuckDB views over
+    the same CSV files and sqlglot executor Tables built (with the imported sqlglot) from the rows."""
+    import duckdb
+    from sqlglot.executor.table import Table
+    cls = te.TestExecutor
+    cls.tpch_conn = duckdb.connect()
+    cls.tpcds_conn = duckdb.connect()
+    cls.tpch_tables = {}
+    schema = te.TPCDS_SCHEMA
+
+    class _LazyTables(dict):
+        def __missing__(self, name):
+            if name not in schema:
+                raise KeyError(name)
+            t = Table(columns=schema[name], rows=list(rows[name]))
+            self[name] = t
+            return t
+
+    cls.tpcds_tables = _LazyTables()
+    state = {"views": False}
+
+    def _conn():
+        if not state["views"]:
+            for table, columns in schema.items():
+                file_name = f"{te.DIR_TPCDS}{table}.csv.gz"
+                cls.tpcds_conn.execute(
+                    f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+                )
+            state["views"] = True
+        return cls.tpcds_conn
+
+    expected = _TPCDS_ROWS.get("expected") or {}
+    from sqlglot import transpile
+
+    def cached_execute(self, sql, tpch=True):
+        # same as TestExecutor.cached_execute; DuckDB's answer for an unchanged transpiled
+        # statement is reused from the pinned commit instead of re-running the query
+        if sql not in self.cache:
+            s = transpile(sql, write="duckdb")[0]
+            hit = expected.get(sql)
+            if not tpch and hit is not None and hit[0] == s:
+                self.cache[sql] = hit[1].copy()
+            else:
+                self.cache[sql] = _conn().execute(s).fetchdf()
+        return self.cache[sql]
+
+    cls.cached_execute = cached_execute
+    cls.cache = {}
+    cls.tpch_sqls = []
+    cls.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))

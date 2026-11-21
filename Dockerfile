@@ -11,7 +11,7 @@ RUN python -c "import tarfile; tarfile.open('/tmp/src.tar.gz').extractall('/app/
     && rm /tmp/src.tar.gz \
     && python -m compileall -q /app/src \
     && chmod -R a+rX /app
-COPY selector.py verify.py cmpprune.py cmp_profile.json.gz import_lines.json.gz tpcds_lines.json.gz /app/
+COPY selector.py verify.py cmpprune.py cmp_profile.json.gz import_lines.json.gz tpcds_lines.json.gz tpcds_expected.pkl.gz /app/
 COPY map /app/map
 RUN python -m compileall -q /app/verify.py /app/cmpprune.py && chmod -R a+rX /app
 ENV BR_SRC=/app/src
