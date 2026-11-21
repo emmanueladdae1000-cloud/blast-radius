@@ -712,7 +712,9 @@ def pack_cost(nums, ms_of):
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPC_FIXED_MS = int(os.environ.get("BR_TPC_FIXED_MS", "3000"))     # imports + class setup (CSV load)
 TPC_QUERY_MS = int(os.environ.get("BR_TPC_QUERY_MS", "260"))      # average per TPC-DS query
-TPC_CONFIRM_MAX = int(os.environ.get("BR_TPC_CONFIRM_MAX", "25"))
+TPC_SAMPLE_OVER = int(os.environ.get("BR_TPC_SAMPLE_OVER", "20"))
+TPC_SAMPLE_FIRST = int(os.environ.get("BR_TPC_SAMPLE_FIRST", "8"))
+TPC_SAMPLE_CHEAP = int(os.environ.get("BR_TPC_SAMPLE_CHEAP", "8"))
 TPC_DEADLINE_S = float(os.environ.get("BR_TPC_DEADLINE_S", "150"))
 MN_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 FP_ON = os.environ.get("BR_FP", "0") == "1"
@@ -1002,36 +1004,6 @@ def main():
                 results[key][1] = keep
         except Exception as e:
             log("verify error", repr(e))
-    # test_execute_tpcds on code edits: run only the TPC-DS queries that reach the edited lines.
-    # Kept test: drop it when they all pass.  Test dropped by the heavy skip: confirm (when cheap)
-    # and put it back if any of those queries fails.
-    if tpc_code and TPCDS_ID in num_of:
-        tnum = num_of[TPCDS_ID]
-        try:
-            import verify
-            import cmpprune
-            for key, (files, q) in sorted(tpc_code.items(), key=lambda kv: (len(kv[1][1]), kv[0])):
-                r = results[key]
-                if set(r[1]) == set(ms_of):
-                    continue
-                if tnum in r[1]:
-                    save = pack_cost(r[1], ms_of) - pack_cost(set(r[1]) - {tnum}, ms_of)
-                    base = (cmpprune._load("tpcds_lines.json.gz") or {}).get("ms") or []
-                    est = TPC_FIXED_MS + sum(int(1.3 * base[i]) + 40 if i < len(base) else TPC_QUERY_MS for i in q)
-                    if est * 1.1 >= save:
-                        r[2] = r[2] + [f"tpcds-code-skip:{len(q)}"]
-                        continue
-                    ok = verify.tpcds_code_probe(SRC, files, q, t0 + TPC_DEADLINE_S, log)
-                    if ok:
-                        r[1] = set(r[1]) - {tnum}
-                    r[2] = r[2] + [f"tpcds-code:{len(q)}:{'pass' if ok else 'kept'}"]
-                elif len(q) <= TPC_CONFIRM_MAX:
-                    ok = verify.tpcds_code_probe(SRC, files, q, t0 + TPC_DEADLINE_S, log)
-                    if not ok:
-                        r[1] = set(r[1]) | {tnum}
-                    r[2] = r[2] + [f"tpcds-confirm:{len(q)}:{'pass' if ok else 'restored'}"]
-        except Exception as e:
-            log("tpcds-code error", repr(e))
     # test_max_nodes (~29 s) on code edits: run a shrunken copy of every step of it on the patched
     # sources (well under a second, CPU-capped); drop the real test when the copy passes.
     if MN_ID in num_of and mn_code:
@@ -1048,6 +1020,45 @@ def main():
                 r[2] = r[2] + [f"maxnodes:{'drop' if ok else 'kept'}"]
         except Exception as e:
             log("maxnodes error", repr(e))
+    # test_execute_tpcds on code edits: run only the TPC-DS queries that reach the edited lines.
+    # Kept test: drop it when they all pass.  Test dropped by the heavy skip: confirm (when cheap)
+    # and put it back if any of those queries fails.
+    if tpc_code and TPCDS_ID in num_of:
+        tnum = num_of[TPCDS_ID]
+        try:
+            import verify
+            import cmpprune
+            for key, (files, q) in sorted(tpc_code.items(), key=lambda kv: (len(kv[1][1]), kv[0])):
+                r = results[key]
+                if set(r[1]) == set(ms_of):
+                    continue
+                base = (cmpprune._load("tpcds_lines.json.gz") or {}).get("ms") or []
+                bms = lambda i: base[i] if i < len(base) else 10 ** 6
+                if len(q) > TPC_SAMPLE_OVER:
+                    # edits reaching most queries: when test_execute_tpcds failed on such mutants it
+                    # failed on dozens of queries, always including the first ones; run the first and
+                    # the cheapest few
+                    qs = sorted(set(q[:TPC_SAMPLE_FIRST]) | set(sorted(q, key=lambda i: (bms(i), i))[:TPC_SAMPLE_CHEAP]))
+                    tag = "sample"
+                else:
+                    qs, tag = q, "full"
+                est = TPC_FIXED_MS + sum(int(1.3 * base[i]) + 40 if i < len(base) else TPC_QUERY_MS for i in qs)
+                if tnum in r[1]:
+                    save = pack_cost(r[1], ms_of) - pack_cost(set(r[1]) - {tnum}, ms_of)
+                    if est * 1.1 >= save:
+                        r[2] = r[2] + [f"tpcds-skip:{tag}:{len(qs)}"]
+                        continue
+                    ok = verify.tpcds_code_probe(SRC, files, qs, t0 + TPC_DEADLINE_S, log)
+                    if ok:
+                        r[1] = set(r[1]) - {tnum}
+                    r[2] = r[2] + [f"tpcds-{tag}:{len(qs)}:{'pass' if ok else 'kept'}"]
+                else:
+                    ok = verify.tpcds_code_probe(SRC, files, qs, t0 + TPC_DEADLINE_S, log)
+                    if not ok:
+                        r[1] = set(r[1]) | {tnum}
+                    r[2] = r[2] + [f"tpcds-confirm-{tag}:{len(qs)}:{'pass' if ok else 'restored'}"]
+        except Exception as e:
+            log("tpcds-code error", repr(e))
     # Ablation probe (practice board only): drop selections for one category of commit.
     probe = os.environ.get("BR_ABLATE") or (open(os.path.join(HERE, "ABLATE")).read().strip()
                                               if os.path.exists(os.path.join(HERE, "ABLATE")) else "")
