@@ -12,6 +12,7 @@ import json
 import os
 import pickle
 import signal
+import struct
 import sys
 import time
 import types
@@ -49,10 +50,48 @@ def _setup(src_root):
 
 
 def _own(code):
-    consts = tuple(("<code>", c.co_qualname) if isinstance(c, types.CodeType) else (type(c).__name__, repr(c)) for c in code.co_consts)
+    consts = tuple(("<code>", c.co_qualname) if isinstance(c, types.CodeType) else _constant_key(c) for c in code.co_consts)
     return (code.co_code, code.co_names, code.co_varnames, code.co_freevars, code.co_cellvars, consts,
             code.co_flags, code.co_argcount, code.co_kwonlyargcount, code.co_posonlyargcount,
             code.co_exceptiontable, code.co_nlocals)
+
+
+def _constant_key(value):
+    """Compiler constants need type-aware equality (True != 1, +0.0 != -0.0)."""
+    if isinstance(value, types.CodeType):
+        return (types.CodeType, _code_key(value))
+    if type(value) in (tuple, frozenset):
+        values = [_constant_key(v) for v in value]
+        return (type(value), frozenset(values) if type(value) is frozenset else tuple(values))
+    if type(value) is float:
+        return (float, struct.pack("!d", value))
+    if type(value) is complex:
+        return (complex, struct.pack("!dd", value.real, value.imag))
+    return (type(value), repr(value))
+
+
+def _code_key(code):
+    # Source positions do not affect execution. Every executable child, constant,
+    # exception handler, name, calling convention and closure slot does.
+    return (_own(code), code.co_name, code.co_qualname, code.co_stacksize,
+            tuple(_constant_key(c) for c in code.co_consts))
+
+
+@lru_cache(maxsize=64)
+def _original_code(path, source):
+    # Patches are written as UTF-8 source files. Compile bytes so a changed
+    # coding cookie has the same effect here as when Python imports that file.
+    return compile(source.encode("utf-8"), path, "exec", dont_inherit=True)
+
+
+@lru_cache(maxsize=64)
+def _original_key(path, source):
+    return _code_key(_original_code(path, source))
+
+
+def compiled_equivalent(path, old_source, new_code):
+    """Compare complete compiled modules, including nested executable code."""
+    return _original_key(path, old_source) == _code_key(new_code)
 
 
 def _codes(code, out, top=True):
@@ -65,14 +104,14 @@ def _codes(code, out, top=True):
 
 @lru_cache(maxsize=32)
 def _old_code_tree(path, source):
-    return _codes(compile(source, path, 'exec', dont_inherit=True), {})
+    return _codes(_original_code(path, source), {})
 
 
 def _plan_swaps(path, old_src, new_src):
     """Return [(qualname, old_code, new_code)] for changed function bodies, or None if
     the change touches module/class-body code (not swappable)."""
     old = _old_code_tree(path, old_src)
-    new = _codes(compile(new_src, path, "exec", dont_inherit=True), {})
+    new = _codes(compile(new_src.encode("utf-8"), path, "exec", dont_inherit=True), {})
     if set(old) != set(new):
         return None
     swaps = []
@@ -142,7 +181,26 @@ class _Result(unittest.TestResult):
 def run(jobs, ids, src_root, deadline, log):
     """jobs: list of (key, {rel: new_src}, [tidx in run order], timeout_s).
     Returns {key: (failed_tidx_list, unrun_tidx_list)} for jobs that completed."""
-    t_start = time.time()
+    # Compilation belongs in the shared parent: child-local caches disappear at
+    # exit and would recompile the same large baseline module for every patch.
+    planned = {}
+    for key, files, _, _ in jobs:
+        try:
+            plans = []
+            for rel, new_src in files.items():
+                path = os.path.join(src_root, rel)
+                with open(path, encoding="utf-8") as fh:
+                    swaps = _plan_swaps(path, fh.read(), new_src)
+                if swaps is None:
+                    break
+                plans.append((path, swaps))
+            else:
+                planned[key] = plans
+        except (OSError, SyntaxError, ValueError):
+            pass
+    jobs = [job for job in jobs if job[0] in planned]
+    if not jobs:
+        return {}
     _setup(src_root)
     import importlib
 
@@ -175,12 +233,8 @@ def run(jobs, ids, src_root, deadline, log):
             code = 1
             try:
                 ok = True
-                for rel, new_src in files.items():
-                    path = os.path.join(src_root, rel)
-                    with open(path, encoding="utf-8") as fh:
-                        old_src = fh.read()
-                    swaps = _plan_swaps(path, old_src, new_src)
-                    if swaps is None or not _apply(path, swaps, function_index):
+                for path, swaps in planned[key]:
+                    if not _apply(path, swaps, function_index):
                         ok = False
                         break
                 failed, unrun = [], []
@@ -296,14 +350,18 @@ def _run_tests(order, ids, mods_by_file):
         if mod is None:
             return failed, order[i:]
         cls = getattr(mod, c)
-        if c not in setup_done:
-            setup_done.add(c)
+        class_key = (f, c)
+        if class_key not in setup_done:
+            setup_done.add(class_key)
             try:
                 cls.setUpClass()
             except BaseException:
                 return failed, order[i:]
         r = _Result()
         cls(m).run(r)
+        if r.skipped or r.testsRun != 1:
+            # A skipped method did not validate the patched behavior.
+            return failed, order[i:]
         if r.bad or r.failures or r.errors or r.unexpectedSuccesses:
             failed.append(t)
             return failed, order[i + 1:]

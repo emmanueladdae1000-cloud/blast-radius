@@ -4,6 +4,7 @@ from collections import defaultdict
 root,out,tests_path=sys.argv[1:]
 with open(tests_path) as f: tests=json.load(f)['tests']
 ids=[t['id'] for t in tests]
+known_tests={str(t['number']) for t in tests}
 records=defaultdict(lambda:defaultdict(dict))
 passed=defaultdict(set)
 blocked=defaultdict(set)
@@ -21,7 +22,7 @@ for path in sorted(glob.glob(root+'/rawcmp_*.json.gz')):
             r['pairs'].update(json.dumps(p,separators=(',',':'),ensure_ascii=True) for p in row['pairs'])
             if len(r['pairs'])>128:r['complete']=False
 if len(seeds)<2: raise RuntimeError('Need at least two hash-seed runs')
-common=set.intersection(*(passed[s]-blocked[s] for s in seeds))
+common=known_tests.intersection(*(passed[s]-blocked[s] for s in seeds))
 result={}
 for site,ts in records.items():
     facts=[]; factidx={}; usable={}

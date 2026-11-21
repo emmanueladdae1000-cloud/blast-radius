@@ -256,6 +256,56 @@ def edits(hunks):
     return out
 
 
+def _typed_config(value):
+    """Keep scalar types and insertion order when comparing parsed config data."""
+    if isinstance(value, dict):
+        return (dict, tuple((_typed_config(k), _typed_config(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return (type(value), tuple(_typed_config(v) for v in value))
+    if type(value) in (float, complex):
+        from verify import _constant_key
+        return _constant_key(value)
+    return (type(value), repr(value))
+
+
+def config_equivalent(rel, change):
+    """Prove supported root configuration edits preserve their complete values."""
+    try:
+        with open(os.path.join(SRC, rel), encoding="utf-8") as fh:
+            original = fh.readlines()
+        patched = apply_hunks(original, change["hunks"])
+        if patched is None:
+            return False
+        old, new = "".join(original), "".join(patched)
+        if rel.endswith(".py"):
+            from verify import compiled_equivalent
+            return compiled_equivalent(os.path.join(SRC, rel), old,
+                                       compile(new.encode("utf-8"), rel, "exec", dont_inherit=True))
+        if rel == "pyproject.toml":
+            import tomllib
+            return _typed_config(tomllib.loads(old)) == _typed_config(tomllib.loads(new))
+        if rel in {"setup.cfg", "tox.ini", "pytest.ini"}:
+            # Keep exact spelling, option order, raw values and defaults. Restrict
+            # the edit itself to whole comment/blank lines; INI consumers may
+            # assign meanings beyond ConfigParser's normal option semantics.
+            removed, _, added, deleted = changed_lines(change["hunks"])
+            if not all(not line.strip() or line.startswith(("#", ";")) for line in added + deleted):
+                return False
+            import configparser
+            def parsed(text):
+                parser = configparser.ConfigParser(interpolation=None)
+                parser.optionxform = str
+                parser.read_string(text)
+                return _typed_config((parser.defaults(), parser._sections))
+            return parsed(old) == parsed(new)
+    except (OSError, ValueError, SyntaxError):
+        pass
+    except Exception:
+        # Unsupported configuration syntax remains conservative.
+        pass
+    return False
+
+
 class Selector:
     def __init__(self, maps):
         self.m = maps
@@ -329,8 +379,31 @@ class Selector:
         removed, ins, added_t, removed_t = changed_lines(ch["hunks"])
         # pure comment/blank edits outside of strings change nothing
         groups = edits(ch["hunks"])
+        orig_path = os.path.join(SRC, rel)
+        orig = new = None
         cookie = any(re.match(r"^[ \t\f]*#.*?coding[:=]", t) for t in added_t + removed_t) and (
             min(removed + ins + [99]) <= 3)
+        if min(removed + ins + [99]) <= 3 and os.path.exists(orig_path):
+            # Inserting an innocent-looking first line can move an existing
+            # coding cookie out of Python's first two physical lines. Compare
+            # the actual byte-source encodings before the comment shortcut.
+            import io
+            import tokenize
+            with open(orig_path, encoding="utf-8") as fh:
+                orig = fh.readlines()
+            new = apply_hunks(orig, ch["hunks"])
+            if new is None:
+                return set(self.m.all), "apply-failed"
+            try:
+                old_encoding = tokenize.detect_encoding(io.BytesIO("".join(orig).encode("utf-8")).readline)[0]
+                new_encoding = tokenize.detect_encoding(io.BytesIO("".join(new).encode("utf-8")).readline)[0]
+                cookie = cookie or old_encoding != new_encoding
+            except (SyntaxError, UnicodeError, LookupError):
+                cookie = True
+        if cookie:
+            # A valid alternate encoding can change every non-ASCII literal,
+            # including lines outside the patch's normal coverage targets.
+            return set(self.m.all), "encoding-all"
         if not cookie and all(is_comment_or_blank(t) for t in added_t + removed_t) and not any(
             in_ranges(l, d["strs"]) for l in removed
         ) and not any(insert_in_string(o, d["strs"]) for o in ins):
@@ -339,18 +412,22 @@ class Selector:
                 self.vok = True
                 return set(), "comment"
         # syntax check of the patched file
-        orig_path = os.path.join(SRC, rel)
         if os.path.exists(orig_path):
-            with open(orig_path, encoding="utf-8") as fh:
-                orig = fh.readlines()
-            new = apply_hunks(orig, ch["hunks"])
+            if orig is None:
+                with open(orig_path, encoding="utf-8") as fh:
+                    orig = fh.readlines()
+                new = apply_hunks(orig, ch["hunks"])
             if new is None:
                 return set(self.m.all), "apply-failed"
             try:
-                compile("".join(new), rel, "exec", dont_inherit=True)
+                new_code = compile("".join(new).encode("utf-8"), rel, "exec", dont_inherit=True)
             except SyntaxError:
                 return self.syntax_broken(rel, d), "syntax"
             self.vsrc = "".join(new)
+            from verify import compiled_equivalent
+            if compiled_equivalent(orig_path, "".join(orig), new_code):
+                self.vok = True
+                return set(), "compiled-same"
         out = set()
         why = []
         vok = self.vsrc is not None and rel.startswith("sqlglot/")
@@ -447,6 +524,17 @@ class Selector:
                 if self.vsrc is not None:
                     self.importcheck[rel] = self.vsrc
                 why.append("import-time:" + ",".join(tg[:3]))
+        if (getattr(self, 'allow_numeric_refinement', False)
+                and rel.startswith('sqlglot/') and self.vsrc is not None
+                and 'NUMERIC_ESCAPES' in ''.join(orig)):
+            try:
+                import numeric_refinement
+                consumers = numeric_refinement.affected_tests(''.join(orig), self.vsrc, self.m, SRC)
+                if consumers is not None:
+                    out &= consumers
+                    why.append('numeric-value-flow')
+            except Exception as error:
+                log('numeric value-flow fallback', rel, type(error).__name__)
         self.vok = vok
         return out, " ".join(sorted(set(why)))
 
@@ -615,7 +703,9 @@ class Selector:
         self.tpc_probe_candidate = None
         self.tpc_probe = None
         n_files = 0
-        for ch in parse_patch(text):
+        changes = parse_patch(text)
+        self.allow_numeric_refinement = len(changes) == 1
+        for ch in changes:
             n_files += 1
             old, new = ch["old"], ch["new"]
             rel = old or new
@@ -662,8 +752,11 @@ class Selector:
                 out |= t
                 notes.append(why)
             elif os.path.basename(rel) in ROOT_CONFIG and "/" not in rel:
-                out |= set(self.m.all)
-                notes.append("rootcfg-all")
+                if old == new and not ch.get("binary") and config_equivalent(rel, ch):
+                    notes.append("rootcfg-same")
+                else:
+                    out |= set(self.m.all)
+                    notes.append("rootcfg-all")
             elif rel.startswith("tests/"):
                 # non-python data under tests/: tests reading it, else files mentioning it
                 t, why = self.fixture_change(rel)
@@ -703,10 +796,98 @@ def pack(items):
 
 
 def pack_cost(nums, ms_of):
-    ws = pack([(n, ms_of[n]) for n in nums])
-    if not ws:
+    durations = sorted((ms_of[n] for n in nums), reverse=True)
+    if not durations:
         return 0
-    return max(sum(ms_of[n] for n in w) for w in ws) + 2000 * len(ws)
+    total = sum(durations)
+    best = total + 2000
+    for workers in range(2, min(8, len(durations)) + 1):
+        # Most small subsets cannot repay even one additional worker. Avoid
+        # constructing all eight worker layouts just to obtain their cost.
+        lower = max(durations[0], (total + workers - 1) // workers) + 2000 * workers
+        if lower >= best:
+            continue
+        loads = [0] * workers
+        for duration in durations:
+            i = loads.index(min(loads))
+            loads[i] += duration
+        best = min(best, max(loads) + 2000 * workers)
+    return best
+
+
+class VerificationCosts:
+    """Baseline CPU facts only; never a patch-to-answer or failing-test map."""
+    def __init__(self, path=None):
+        try:
+            with open(path or os.path.join(HERE, "test_costs.json")) as fh:
+                data = json.load(fh)
+            self.tests = data["tests_ms_by_id"]
+            self.classes = data["setup_ms_by_class"]
+        except (OSError, ValueError, KeyError):
+            self.tests, self.classes = {}, {}
+
+    @staticmethod
+    def class_id(test_id):
+        return "::".join(test_id.split("::")[:2])
+
+    def estimate(self, tests, ids, fresh=False):
+        classes = {self.class_id(ids[t]) for t in tests}
+        # Warm observations vary with CPU and caches. Charge for every class
+        # setup in every isolated job, and leave room for imports/fork overhead.
+        warm = sum(max(1, self.tests[ids[t]]) for t in tests)
+        setup = sum(max(30, self.classes.get(c, 30)) for c in classes)
+        return int(1.6 * warm + 1.25 * setup + (400 if fresh else 90))
+
+    def subset(self, candidates, ids, num_of, ms_of, fresh=False):
+        """Choose actual full methods by optimistic *packed* savings minus CPU.
+
+        Only measured tests are eligible. Every other candidate remains selected.
+        Prefixes and class groups avoid quadratic per-test packing searches.
+        """
+        nums = {num_of[ids[t]] for t in candidates if ids[t] in num_of}
+        eligible = [t for t in candidates if ids[t] in self.tests
+                    and ids[t] in num_of and ids[t] not in NO_VERIFY]
+        if not eligible:
+            return None
+        before = pack_cost(nums, ms_of)
+        recorded = lambda t: ms_of[num_of[ids[t]]]
+        warm = lambda t: max(1, self.tests[ids[t]])
+        ranked = sorted(eligible, key=lambda t: (-recorded(t) / warm(t), warm(t), t))
+        plans = []
+        # Include the whole cheap frontier, not just small candidate sets. This
+        # captures eliminating a worker's fixed cost after many tiny tests pass.
+        for ceiling in (3, 10, 30, 100, 300, 1000, 3000, float("inf")):
+            plans.append([t for t in ranked if warm(t) <= ceiling])
+        for ratio in (0.5, 1.0, 2.0, 4.0, 8.0):
+            plans.append([t for t in ranked if recorded(t) >= ratio * warm(t)])
+        groups = {}
+        for t in ranked:
+            groups.setdefault(self.class_id(ids[t]), []).append(t)
+        plans.extend(groups.values())
+        # A CPU cap is independent of recorded test durations. The runtime still
+        # keeps every test if verification fails or times out.
+        cap = float(os.environ.get("BR_V_JOB_CPU_MS", "5000"))
+        best, seen = None, set()
+        for plan in plans:
+            if not plan:
+                continue
+            key = frozenset(plan)
+            if key in seen:
+                continue
+            seen.add(key)
+            estimate = self.estimate(plan, ids, fresh)
+            if estimate > cap:
+                continue
+            keep = nums - {num_of[ids[t]] for t in plan}
+            save = before - pack_cost(keep, ms_of)
+            net = save - estimate
+            if net <= 150:
+                continue
+            if best is None or (net, -estimate) > (best[3], -best[1]):
+                # Cheap detectors first; class grouping also shares setup work.
+                order = sorted(plan, key=lambda t: (self.class_id(ids[t]), warm(t), t))
+                best = (order, estimate, save, net)
+        return best
 
 
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
@@ -744,28 +925,13 @@ def commit_category(notes):
 
 
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
-HEAVY_CLASSES = {"tests/test_executor.py::TestExecutor"}
 # tests that start a fresh interpreter (they would see the unpatched files)
 NO_VERIFY = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
 SUBPROCESS_IMPORT_TESTS = NO_VERIFY
-V_MAX_MS = int(os.environ.get("BR_V_MAX_MS", "2000"))      # total recorded ms of a verified set
-V_MAX_TEST_MS = int(os.environ.get("BR_V_MAX_TEST_MS", "1500"))
-V_MAX_TESTS = int(os.environ.get("BR_V_MAX_TESTS", "120"))
 V_BUDGET_S = float(os.environ.get("BR_V_BUDGET_S", "90"))
-V_FRESH_MAX_MS = int(os.environ.get("BR_V_FRESH_MAX_MS", "1500"))
 # Verification stops at this many seconds after start, whatever the commit count
 # (practice allows 180 s for the batch, the final 270 s).
 V_DEADLINE_S = float(os.environ.get("BR_V_DEADLINE_S", "110"))
-PARTIAL_VERIFY = os.environ.get("BR_PARTIAL_VERIFY", "1") == "1"
-# Keep expensive unrun tests while verifying economical subsets of other candidates.
-EXPENSIVE_TESTS = {
-    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
-    "tests/test_executor.py::TestExecutor::test_execute_tpch",
-    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
-}
-HS_MAX_MS = int(os.environ.get("BR_HS_MAX_MS", "2500"))
-HS_MAX_TEST_MS = int(os.environ.get("BR_HS_MAX_TEST_MS", "2600"))
-HS_MIN_RUN = int(os.environ.get("BR_HS_MIN_RUN", "5"))
 
 
 def main():
@@ -780,6 +946,7 @@ def main():
         tj = json.load(fh)
     num_of = {t["id"]: t["number"] for t in tj["tests"]}
     ms_of = {t["number"]: round(t["seconds"] * 1000) for t in tj["tests"]}
+    verification_costs = VerificationCosts()
     known = set(maps.ids)
     unknown = [t["number"] for t in tj["tests"] if t["id"] not in known]
     if unknown:
@@ -792,6 +959,7 @@ def main():
     ichecks = []
     probes = []    # TPC-DS query edits: run the edited queries the way test_execute_tpcds does
     special = {}   # key -> tests to keep when every cheap candidate passed (heavy skip)
+    job_economics = {}  # key -> estimated CPU ms, optimistic packed savings ms
     fp_state = {}  # pinned import fingerprint (computed on first need) and its unstable keys
     tpc_code = {}  # key -> (patched sources, test_execute_tpcds query indices reaching the edit)
     mn_code = {}   # key -> patched sources, for code edits whose candidates include test_max_nodes
@@ -864,45 +1032,22 @@ def main():
                     notes = notes + [f"operand-trace:{before}->{len(tset)}"]
             v = sel.verify
             fresh_job = False
-            if VERIFY and tset and tset != maps.all and len(tset) <= V_MAX_TESTS:
-                tl = sorted(tset, key=lambda t: (ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6), t))
-                tot = sum(ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6) for t in tl)
-                heavy = any("::".join(maps.ids[t].split("::")[:2]) in HEAVY_CLASSES or maps.ids[t] in NO_VERIFY for t in tl)
-                big = any(ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6) > V_MAX_TEST_MS for t in tl)
+            if VERIFY and tset and tset != maps.all:
                 swap_ok = v["ok"] and v["src"] and not sel.importcheck
                 fresh_ok = v["fresh_ok"] and v["allsrc"]
-                msf = lambda t: ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6)
-                monsters = [t for t in tl if maps.ids[t] in EXPENSIVE_TESTS]
-                if not heavy and not big and tot <= V_MAX_MS:
+                choice = (verification_costs.subset(tset, maps.ids, num_of, ms_of, fresh=not swap_ok)
+                          if swap_ok or fresh_ok else None)
+                if choice:
+                    order, estimate, saving, _ = choice
+                    job_economics[len(results)] = (estimate, saving)
+                    special[len(results)] = nums - {num_of[maps.ids[t]] for t in order}
+                    timeout = max(4.0, 2.0 + 4.0 * estimate / 1000.0)
+                    notes += [f"verify-plan:{len(order)}:{estimate}/{saving}ms"]
                     if swap_ok:
-                        jobs.append((len(results), v["src"], tl, 4.0 + 4.0 * tot / 1000.0))
-                    elif fresh_ok and tot <= V_FRESH_MAX_MS:
-                        fresh.append((len(results), dict(v["allsrc"]), tl, 6.0 + 4.0 * tot / 1000.0))
+                        jobs.append((len(results), v["src"], order, timeout))
+                    else:
+                        fresh.append((len(results), dict(v["allsrc"]), order, timeout))
                         fresh_job = True
-                elif PARTIAL_VERIFY and monsters and (swap_ok or fresh_ok):
-                    # Run every cheap candidate here. Any failure: keep the full set.
-                    # Remove only candidates actually verified passing; retain every unrun test.
-                    # kill detectors: the cheapest candidates, up to HS_MAX_MS of recorded time
-                    run, runtot = [], 0
-                    exe = "tests/test_executor.py::TestExecutor"
-                    # cheapest first, non-executor tests before executor ones (whose class
-                    # setup loads the TPC data)
-                    for t in sorted(tl, key=lambda t: ("::".join(maps.ids[t].split("::")[:2]) == exe, msf(t), t)):
-                        if t in monsters or maps.ids[t] in NO_VERIFY or msf(t) > HS_MAX_TEST_MS:
-                            continue
-                        if runtot + msf(t) > HS_MAX_MS:
-                            break
-                        run.append(t)
-                        runtot += msf(t)
-                    ship = [t for t in tl if t not in run]
-                    if len(run) >= HS_MIN_RUN and runtot <= HS_MAX_MS:
-                        keep_ship = {num_of[maps.ids[t]] for t in ship if maps.ids[t] in num_of}
-                        special[len(results)] = keep_ship
-                        if swap_ok:
-                            jobs.append((len(results), v["src"], run, 6.0 + 3.0 * runtot / 1000.0))
-                        else:
-                            fresh.append((len(results), dict(v["allsrc"]), run, 8.0 + 3.0 * runtot / 1000.0))
-                            fresh_job = True
             if VERIFY and sel.tpc_probe:
                 probes.append((len(results), sel.tpc_probe))
             if VERIFY and tset and tset != maps.all and any(maps.ids[t] == TPCDS_ID for t in tset):
@@ -921,6 +1066,23 @@ def main():
             nums = set(ms_of)
             notes = ["error-all"]
         results.append([cid, nums, notes])
+    # Spend the batch CPU budget on the strongest measured opportunities first.
+    # Rejected or unstarted jobs leave their original candidate sets untouched.
+    def priority(job):
+        estimate, saving = job_economics[job[0]]
+        return (-(saving - estimate) / estimate, -saving, job[0])
+    remaining = int(V_BUDGET_S * 1000)
+    selected = set()
+    for job in sorted(jobs + fresh, key=priority):
+        estimate, _ = job_economics[job[0]]
+        if estimate <= remaining:
+            selected.add(job[0])
+            remaining -= estimate
+    for key, files, _, _ in fresh:
+        if key not in selected:
+            ichecks.append((key, files))
+    jobs = sorted((j for j in jobs if j[0] in selected), key=priority)
+    fresh = sorted((j for j in fresh if j[0] in selected), key=priority)
     if ichecks:
         try:
             import verify
@@ -948,7 +1110,6 @@ def main():
     if fresh:
         try:
             import verify
-            fresh.sort(key=lambda j: (j[0] not in special, j[0]))
             done = verify.run_fresh(fresh, maps.ids, SRC, t0 + V_DEADLINE_S * 0.4, log)
             for key, files, _, _ in fresh:
                 res = done.get(key)
@@ -974,7 +1135,6 @@ def main():
     if jobs:
         try:
             import verify
-            jobs.sort(key=lambda j: (j[0] not in special, j[0]))
             done = verify.run(jobs, maps.ids, SRC, t0 + V_DEADLINE_S, log)
             for key, (failed, unrun) in done.items():
                 keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}

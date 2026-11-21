@@ -199,6 +199,87 @@ def compare_only_changes(old_src, new_src):
     return changes
 
 
+def _literal_operand(node):
+    """Encode an exact scalar literal, without evaluating source expressions."""
+    if isinstance(node, ast.Constant):
+        value = node.value
+    elif (isinstance(node, ast.UnaryOp) and type(node.op) in (ast.UAdd, ast.USub)
+          and isinstance(node.operand, ast.Constant)
+          and type(node.operand.value) in (int, float)):
+        value = node.operand.value
+        if isinstance(node.op, ast.USub):
+            value = -value
+    else:
+        return None
+    if value is None: return ['none']
+    if type(value) is bool: return ['bool', value]
+    if type(value) is int:
+        return ['int', str(value)] if value.bit_length() <= 256 else None
+    if type(value) is float: return ['float', value.hex()]
+    if type(value) is str:
+        return ['str', value] if len(value) <= 256 else None
+    if type(value) is bytes:
+        return ['bytes', value.hex()] if len(value) <= 128 else None
+    return None
+
+
+def compare_operand_changes(old_src, new_src):
+    """Recognize only operator/scalar-literal edits to single comparisons.
+
+    Each result is (old line, old column, old operator, new operator,
+    left replacement, right replacement). A replacement is (old encoding, new
+    encoding), or None for an unchanged operand. All other AST fields, including
+    their child positions, must match; nested comparisons are checked separately.
+    The operator-only compare_only_changes API deliberately remains unchanged.
+    """
+    try:
+        old_tree, new_tree = _parse_source(old_src), _parse_source(new_src)
+    except SyntaxError:
+        return None
+    changes = []
+
+    def same_literal(old, new):
+        before, after = _literal_operand(old), _literal_operand(new)
+        if before is None or after is None:
+            return None
+        if ast.dump(old) == ast.dump(new):
+            return ()
+        return (before, after)
+
+    def match(old, new):
+        if type(old) is not type(new):
+            return False
+        if isinstance(old, ast.Compare) and len(old.ops) == len(new.ops) == 1:
+            before, after = type(old.ops[0]), type(new.ops[0])
+            if before in _CMP_OPS and after in _CMP_OPS:
+                replacements = []
+                for a, b in ((old.left, new.left),
+                             (old.comparators[0], new.comparators[0])):
+                    literal = same_literal(a, b)
+                    if literal is None:
+                        if not match(a, b):
+                            return False
+                        replacements.append(None)
+                    else:
+                        replacements.append(literal or None)
+                if before is not after or any(replacements):
+                    if any(replacements) and (before in (ast.Is, ast.IsNot)
+                                              or after in (ast.Is, ast.IsNot)):
+                        return False
+                    changes.append((old.lineno, old.col_offset,
+                                    _CMP_OPS[before], _CMP_OPS[after],
+                                    *replacements))
+                return True
+        if isinstance(old, ast.AST):
+            return all(match(a, b) for (_, a), (_, b) in
+                       zip(ast.iter_fields(old), ast.iter_fields(new)))
+        if isinstance(old, list):
+            return len(old) == len(new) and all(match(a, b) for a, b in zip(old, new))
+        return old == new
+
+    return changes if match(old_tree, new_tree) else None
+
+
 def _primitive_value(encoded):
     kind = encoded[0]
     if kind.endswith('_subclass'):
@@ -257,12 +338,12 @@ def safe_tests(patch_text, src_root):
             patched = apply_hunks(original, info['hunks'])
             if patched is None:
                 return set()
-            changes = compare_only_changes(original, patched)
+            changes = compare_operand_changes(original, patched)
         except (OSError, ValueError, SyntaxError):
             return set()
         if changes is None:
             return set()
-        for line, col, before, after in changes:
+        for line, col, before, after, replace_left, replace_right in changes:
             changed = True
             if line in imports.get(rel, ()):
                 return set()
@@ -281,9 +362,22 @@ def safe_tests(patch_text, src_root):
                         try:
                             left, right, identical, observed = facts[index]
                             old = _observed_compare(before, left, right, identical)
-                            new = _observed_compare(after, left, right, identical)
+                            new_left, new_right = left, right
+                            if replace_left is not None:
+                                if left != replace_left[0]:
+                                    raise ValueError('Literal differs from baseline observation')
+                                new_left = replace_left[1]
+                            if replace_right is not None:
+                                if right != replace_right[0]:
+                                    raise ValueError('Literal differs from baseline observation')
+                                new_right = replace_right[1]
+                            if replace_left is not None or replace_right is not None:
+                                # Literal edits never use identity operators. Equality still
+                                # needs fresh aliasing when a replacement introduces None.
+                                identical = new_left[0] == new_right[0] == 'none'
+                            new = _observed_compare(after, new_left, new_right, identical)
                             evaluations[index] = old is observed and new is observed
-                        except (ValueError, TypeError, KeyError, OverflowError):
+                        except (ValueError, TypeError, KeyError, IndexError, OverflowError):
                             evaluations[index] = False
                     if not evaluations[index]:
                         unchanged = False

@@ -1,48 +1,55 @@
-# Validation
+# Candidate validation
 
-This is local validation. No official hidden practice/final result has been obtained.
+Official score before this revision:168.9 seconds,158.846 simulated + about10 seconds CPU,
+with zero missed commits. The revised official score is pending submission.
 
-## Official 30-commit public sample
+## Public sample, exact competition runtime limits
 
-Exact competition sandbox flags: linux/amd64, no network, 2 CPUs, 4 GB memory with
-no swap, 256 processes, read-only root, 64 MB /tmp, nobody user, dropped capabilities.
-Only patches and tests.json were mounted into the selector. The unchanged official
-scorer checked its output separately, with sample answers unavailable to the selector.
-Measured CPU includes selector descendants and the small measurement wrapper.
-
-| Run | Simulated seconds | CPU seconds | Total seconds | Misses |
+| Run | Simulated | CPU | Total | Misses |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 106.125 | 5.546145 | 111.671145 | 0 |
-| 2 | 106.125 | 5.567669 | 111.692669 | 0 |
-| 3 | 106.125 | 6.389825 | 112.514825 | 0 |
+|1|103.357|4.900600|108.257600|0|
+|2|103.357|5.194315|108.551315|0|
+|3|103.357|5.215891|108.572891|0|
 
-Median total 111.692669 seconds; rounded by the scoring rule: **111.7 seconds**.
+Three-run median108.551315; rounded per scoring rule: **108.6 seconds**.
+Measured CPU includes the selector, its children and the small measurement wrapper.
+The original official scorer checked outputs separately; answers were never mounted
+into the selector. The sandbox used linux/amd64,2 CPUs,4GB/no swap, nobody,
+read-only root,64MB /tmp, no network,256 processes and dropped capabilities.
 
-## Existing 15-case local validation set (evalA)
+## Independent labels and regressions
 
-One run: simulated 104.408 + CPU 10.439916 = total 114.847916 seconds, zero misses
-against that dataset's labels. This is a different local dataset, not the hidden
-practice data, and only one run was measured.
+* Existing15-case evalA:103.396 simulated +11.144155 CPU =114.540155 total, zero misses.
+* Twelve newly generated independent cases were each labeled by a full pinned pytest
+  suite run. This includes harmless root-config/dictionary/enum rewrites, literal
+  boundary changes, real class-constant faults, fixture and mixed edits.
+  Candidate55.222 simulated +2.050413CPU =57.272413total, zero misses.
+  Prior entry on the identical12 cases:106.102 simulated +5.038823CPU =111.140823total,
+  zero misses. These aggregate totals are not comparable to the practice leaderboard.
+*4476 operand/operator semantic checks,40 literal-refinement checks,12 economic
+  verifier tests and11 numeric data-flow tests pass. Economic tests also check100
+  randomized packing-cost equivalences and real source-encoding changes.
+* Whole-patch safety check: one literal numeric-value change narrows273 original
+  candidates to10; an added second-file edit disables that refinement and retains273.
+* Every runtime file and data map matches the tested image hashes.
 
-## Additional accuracy checks
+## Complete raw baseline observations
 
-* 4,476 independent operand/operator cases, including primitive identity, NaN,
-  scalar/enum subtypes, overloaded and mutable comparison methods.
-* Compound changes involving global declarations and dictionary unpacking are
-  rejected by comparison-only reasoning; absent and import-time observations retain tests.
-* Four fresh focused regressions were executed against the real pinned pytest tests:
-  parser node-count threshold, mixed parser/fixture edit, MySQL normalization class
-  constant, and expected-output-only TPC fixture edit. Every independently confirmed
-  failing test is retained. These are minimum required sets, not complete failure sets.
-* The raw-observation generator ran the unmodified full checkout under two hash
-  seeds: 1618 tests passed and 1 skipped in each run; the expensive max-nodes and
-  memory-leak tests were excluded from profiling and cannot be removed by its facts.
-* All 314 files in src.tar.gz match the pinned upstream checkout byte-for-byte.
-* score.py is unchanged from the supplied official starter. Current runtime files
-  and maps match the tested Docker image hashes.
+Both unmodified pinned source runs completed without scored failures or exclusions:
+seed317:1620 passed,1skipped,25440subtests,464.11seconds;
+seed391:1620 passed,1skipped,25440subtests,491.15seconds.
 
-## Limits
+The merged artifact has1562 sites and142219 site/test observation pairs. Parser
+max_nodes1490 has47 usable sites, Athena max_nodes9 has61, generator-memory1224 has20.
+Untracked asynchronous tests214/1565 are excluded from deductions. A preliminary
+300-second profiling timeout was not merged. No alternate operators or mutation
+outcomes were generated during baseline profiling.
 
-Hardware and unseen patches can change scores. These measurements establish a
-sub-120 public-sample result; an official submission is needed to confirm the
-requested threshold on the hidden practice/final datasets.
+The source archive retains exact pinned SQLGlot/test files and adds exact pinned
+root configuration files, allowing semantic root-config checks to run in production.
+Numeric data-flow audit runs only on the pinned source during the image build.
+
+## Interpretation
+
+These are local results and regression evidence. Only the official hidden scorer
+can confirm the user's requested below110/first-place result. Final data is unseen.

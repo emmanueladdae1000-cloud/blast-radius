@@ -12,6 +12,7 @@ COLLECTION_FAILED = []
 TASK_N = 0
 OPS = {ast.Eq:'==', ast.NotEq:'!=', ast.Lt:'<', ast.LtE:'<=', ast.Gt:'>', ast.GtE:'>=', ast.Is:'is', ast.IsNot:'is not'}
 ORIGINAL = {'==':operator.eq, '!=':operator.ne, '<':operator.lt, '<=':operator.le, '>':operator.gt, '>=':operator.ge, 'is':operator.is_, 'is not':operator.is_not}
+RICH_NAMES=frozenset(('__eq__','__ne__','__lt__','__le__','__gt__','__ge__'))
 with open(os.environ.get('BR_TESTS_JSON', '/data/tests.json')) as f:
     ID2NUM = {t['id']:t['number'] for t in json.load(f)['tests']}
 
@@ -42,8 +43,14 @@ def encode(v):
     # A subtype is supported only when EVERY rich comparison slot is unchanged.
     for base in (str,int,float,bytes):
         if not any(cls is base for cls in mro): continue
-        names=('__eq__','__ne__','__lt__','__le__','__gt__','__ge__')
-        if not all(static_method(t,n) is static_method(base,n) for n in names): return None
+        # The first definitions of the six slots must be the builtin's own.
+        # Check the MRO prefix once, inspecting every override on every call;
+        # this also detects classes whose comparison methods change at runtime.
+        base_namespace=type.__getattribute__(base,'__dict__')
+        for cls in mro:
+            if cls is base: break
+            namespace=type.__getattribute__(cls,'__dict__')
+            if any(namespace[n] is not base_namespace[n] for n in namespace.keys() & RICH_NAMES): return None
         if base is str:
             value=str.__str__(v)
             if len(value)>256: return None
@@ -59,7 +66,14 @@ def encode(v):
     return identity_type(t)
 def record(site,a,b,result,valid=True,identical=False):
     if ACTIVE[0] is None: return
-    row=OBS.setdefault(site,{}).setdefault(ACTIVE[0],{'pairs':set(),'complete':True})
+    rows=OBS.get(site)
+    if rows is None:
+        rows={}
+        OBS[site]=rows
+    row=rows.get(ACTIVE[0])
+    if row is None:
+        row={'pairs':set(),'complete':True}
+        rows[ACTIVE[0]]=row
     if not row['complete']: return
     if not valid:
         row['complete']=False
@@ -74,6 +88,15 @@ def record(site,a,b,result,valid=True,identical=False):
     else: row['pairs'].add(pair)
 
 def compare(site,a,b):
+    # Calls outside a running test cannot contribute an observation. A row which
+    # cannot be certified stays incomplete, so further operand encoding only
+    # adds overhead (especially in parser size and memory-leak properties).
+    tid=ACTIVE[0]
+    if tid is None:
+        return ORIGINAL[NODES[site][3]](a,b)
+    row=OBS.get(site,{}).get(tid)
+    if row is not None and not row['complete']:
+        return ORIGINAL[NODES[site][3]](a,b)
     try:
         aa,bb=encode(a),encode(b)
         identical=a is b

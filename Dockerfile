@@ -12,8 +12,10 @@ RUN python -c "import tarfile; tarfile.open('/tmp/src.tar.gz').extractall('/app/
     && rm /tmp/src.tar.gz \
     && python -m compileall -q /app/src \
     && chmod -R a+rX /app
-COPY selector.py verify.py cmpprune.py operand_trace.json.gz import_lines.json.gz tpcds_lines.json.gz tpcds_expected.pkl.gz /app/
+COPY selector.py verify.py cmpprune.py numeric_refinement.py test_costs.json operand_trace.json.gz import_lines.json.gz tpcds_lines.json.gz tpcds_expected.pkl.gz /app/
 COPY map /app/map
-RUN python -m compileall -q /app/verify.py /app/cmpprune.py && chmod -R a+rX /app
+RUN python /app/numeric_refinement.py --build-audit /app/src \
+    && python -m compileall -q /app/verify.py /app/cmpprune.py /app/numeric_refinement.py \
+    && chmod -R a+rX /app
 ENV BR_SRC=/app/src
 CMD ["python", "/app/selector.py"]
