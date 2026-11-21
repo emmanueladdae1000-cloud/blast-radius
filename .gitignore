@@ -1,2 +1,6 @@
-output.jsonl
+sample/
+reports/
 __pycache__/
+*.pyc
+*.jsonl
+cmp_profile.json.gz

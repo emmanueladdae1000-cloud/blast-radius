@@ -1,0 +1,9 @@
+sample/
+reports/
+tools/
+.git/
+__pycache__/
+*.ps1
+*.jsonl
+cmp_profile.json.gz
+Dockerfile.profile

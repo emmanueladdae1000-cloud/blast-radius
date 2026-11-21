@@ -756,12 +756,9 @@ V_FRESH_MAX_MS = int(os.environ.get("BR_V_FRESH_MAX_MS", "1500"))
 # Verification stops at this many seconds after start, whatever the commit count
 # (practice allows 180 s for the batch, the final 270 s).
 V_DEADLINE_S = float(os.environ.get("BR_V_DEADLINE_S", "110"))
-HEAVY_SKIP = os.environ.get("BR_HEAVY_SKIP", "1") == "1"
-# End-to-end executor runs over TPC queries: they exercise the same optimizer and
-# executor code as many cheap tests, so a break they would catch also breaks cheap
-# candidates (measured on mutants of the pinned commit). Property tests such as the
-# memory-leak and AST-node-limit tests are never skipped.
-GAMBLE_TESTS = {
+PARTIAL_VERIFY = os.environ.get("BR_PARTIAL_VERIFY", "1") == "1"
+# Keep expensive unrun tests while verifying economical subsets of other candidates.
+EXPENSIVE_TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds",
     "tests/test_executor.py::TestExecutor::test_execute_tpch",
     "tests/test_executor.py::TestExecutor::test_optimized_tpch",
@@ -853,7 +850,7 @@ def main():
             if tset == maps.all:
                 nums |= set(unknown)
             elif tset:
-                # comparison-operator swaps: drop tests the comparison profile proves unaffected
+                # Comparison-only changes: reason over raw edit-independent baseline observations.
                 try:
                     import cmpprune
                     safe_ids = cmpprune.safe_tests(text, SRC)
@@ -864,7 +861,7 @@ def main():
                     before = len(tset)
                     tset = {t for t in tset if maps.ids[t] not in safe_ids}
                     nums = {num_of[maps.ids[t]] for t in tset if maps.ids[t] in num_of}
-                    notes = notes + [f"cmp-profile:{before}->{len(tset)}"]
+                    notes = notes + [f"operand-trace:{before}->{len(tset)}"]
             v = sel.verify
             fresh_job = False
             if VERIFY and tset and tset != maps.all and len(tset) <= V_MAX_TESTS:
@@ -875,16 +872,16 @@ def main():
                 swap_ok = v["ok"] and v["src"] and not sel.importcheck
                 fresh_ok = v["fresh_ok"] and v["allsrc"]
                 msf = lambda t: ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6)
-                monsters = [t for t in tl if maps.ids[t] in GAMBLE_TESTS]
+                monsters = [t for t in tl if maps.ids[t] in EXPENSIVE_TESTS]
                 if not heavy and not big and tot <= V_MAX_MS:
                     if swap_ok:
                         jobs.append((len(results), v["src"], tl, 4.0 + 4.0 * tot / 1000.0))
                     elif fresh_ok and tot <= V_FRESH_MAX_MS:
                         fresh.append((len(results), dict(v["allsrc"]), tl, 6.0 + 4.0 * tot / 1000.0))
                         fresh_job = True
-                elif HEAVY_SKIP and monsters and (swap_ok or fresh_ok):
+                elif PARTIAL_VERIFY and monsters and (swap_ok or fresh_ok):
                     # Run every cheap candidate here. Any failure: keep the full set.
-                    # All pass: the monster tests are dropped (they cover the same code).
+                    # Remove only candidates actually verified passing; retain every unrun test.
                     # kill detectors: the cheapest candidates, up to HS_MAX_MS of recorded time
                     run, runtot = [], 0
                     exe = "tests/test_executor.py::TestExecutor"
@@ -897,7 +894,7 @@ def main():
                             break
                         run.append(t)
                         runtot += msf(t)
-                    ship = [t for t in tl if t not in monsters and t not in run]
+                    ship = [t for t in tl if t not in run]
                     if len(run) >= HS_MIN_RUN and runtot <= HS_MAX_MS:
                         keep_ship = {num_of[maps.ids[t]] for t in ship if maps.ids[t] in num_of}
                         special[len(results)] = keep_ship
@@ -917,15 +914,6 @@ def main():
                     tp_info = None
                 if tp_info is not None:
                     tpc_code[len(results)] = tp_info
-            if VERIFY and tset and tset != maps.all and any(maps.ids[t] == MN_ID for t in tset):
-                try:
-                    import cmpprune
-                    mfiles = cmpprune.code_patch_files(text, SRC, allow_fixtures=True)  # test_max_nodes reads no fixture
-                except Exception as e:
-                    log("maxnodes-files error", cid, repr(e))
-                    mfiles = None
-                if mfiles:
-                    mn_code[len(results)] = mfiles
             if sel.importcheck and not fresh_job:
                 ichecks.append((len(results), dict(sel.importcheck)))
         except Exception as e:  # never crash: run everything for this commit
@@ -974,13 +962,9 @@ def main():
                     results[key][2] = results[key][2] + ["import-broken-all"]
                 else:
                     failed, unrun = res
+                    keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
                     if key in special:
-                        if failed or unrun:
-                            results[key][2] = results[key][2] + ["heavy-kept"]
-                            continue
-                        keep = special[key]
-                    else:
-                        keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
+                        keep |= special[key]
                     results[key][2] = results[key][2] + [f"fresh-verified:{len(results[key][1])}->{len(keep)}"]
                     results[key][1] = keep
         except Exception as e:
@@ -993,33 +977,14 @@ def main():
             jobs.sort(key=lambda j: (j[0] not in special, j[0]))
             done = verify.run(jobs, maps.ids, SRC, t0 + V_DEADLINE_S, log)
             for key, (failed, unrun) in done.items():
+                keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
                 if key in special:
-                    if failed or unrun:
-                        results[key][2] = results[key][2] + ["heavy-kept"]
-                        continue
-                    keep = special[key]
-                else:
-                    keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
+                    keep |= special[key]
                 results[key][2] = results[key][2] + [f"verified:{len(results[key][1])}->{len(keep)}"]
                 results[key][1] = keep
         except Exception as e:
             log("verify error", repr(e))
-    # test_max_nodes (~29 s) on code edits: run a shrunken copy of every step of it on the patched
-    # sources (well under a second, CPU-capped); drop the real test when the copy passes.
-    if MN_ID in num_of and mn_code:
-        mnum = num_of[MN_ID]
-        try:
-            import verify
-            for key, files in sorted(mn_code.items()):
-                r = results[key]
-                if mnum not in r[1] or set(r[1]) == set(ms_of):
-                    continue
-                ok = verify.maxnodes_proxy(SRC, files, t0 + MN_DEADLINE_S, log)
-                if ok:
-                    r[1] = set(r[1]) - {mnum}
-                r[2] = r[2] + [f"maxnodes:{'drop' if ok else 'kept'}"]
-        except Exception as e:
-            log("maxnodes error", repr(e))
+    # Keep unrun property tests: a reduced-size proxy cannot validate the original test.
     # test_execute_tpcds on code edits: run only the TPC-DS queries that reach the edited lines.
     # Kept test: drop it when they all pass.  Test dropped by the heavy skip: confirm (when cheap)
     # and put it back if any of those queries fails.
@@ -1034,14 +999,7 @@ def main():
                     continue
                 base = (cmpprune._load("tpcds_lines.json.gz") or {}).get("ms") or []
                 bms = lambda i: base[i] if i < len(base) else 10 ** 6
-                if len(q) > TPC_SAMPLE_OVER:
-                    # edits reaching most queries: when test_execute_tpcds failed on such mutants it
-                    # failed on dozens of queries, always including the first ones; run the first and
-                    # the cheapest few
-                    qs = sorted(set(q[:TPC_SAMPLE_FIRST]) | set(sorted(q, key=lambda i: (bms(i), i))[:TPC_SAMPLE_CHEAP]))
-                    tag = "sample"
-                else:
-                    qs, tag = q, "full"
+                qs, tag = q, 'full'
                 est = TPC_FIXED_MS + sum(int(1.3 * base[i]) + 40 if i < len(base) else TPC_QUERY_MS for i in qs)
                 if tnum in r[1]:
                     save = pack_cost(r[1], ms_of) - pack_cost(set(r[1]) - {tnum}, ms_of)
@@ -1059,13 +1017,6 @@ def main():
                     r[2] = r[2] + [f"tpcds-confirm-{tag}:{len(qs)}:{'pass' if ok else 'restored'}"]
         except Exception as e:
             log("tpcds-code error", repr(e))
-    # Ablation probe (practice board only): drop selections for one category of commit.
-    probe = os.environ.get("BR_ABLATE") or (open(os.path.join(HERE, "ABLATE")).read().strip()
-                                              if os.path.exists(os.path.join(HERE, "ABLATE")) else "")
-    if probe:
-        for r in results:
-            if commit_category(r[2]) == probe:
-                r[1] = set()
     cats = {}
     for r in results:
         c = commit_category(r[2])

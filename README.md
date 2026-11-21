@@ -1,84 +1,76 @@
-# Blast Radius entry
+# RWX Blast Radius entry
 
-Picks, for each sqlglot patch, the tests that can observe the change, then splits
-them over workers to minimise `busiest worker + 2 s per worker`.
+Select tests for independent patches against SQLGlot commit
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, then pack them across one to eight workers.
 
-## How it decides
+## Run on Windows
 
-Everything below is built once from the pinned commit `eb11aec` (allowed: "maps built
-from the pinned commit"). No patch, kind of edit, or answer is looked up.
+Docker Desktop must be running with Linux containers. Put the official starter sample/ directory in this folder first; extract the starter into a separate folder so it does not overwrite the entry. No host Python or make is needed:
 
-1. **Per-test line coverage** (`tools/forktrace.py`). The parent imports all of sqlglot
-   once, runs each test class's `setUpClass`, then forks one child per test, so every
-   test's coverage is exact even with caches and lazy imports. Lines run at import
-   time, during `setUpClass`, or while importing a test module are kept separately
-   and attributed to every test they can affect. Process-pool work runs in process
-   (with a pickle round trip, as a real pool does) so it is attributed too.
-2. **Class usage**: which sqlglot classes (expressions, dialects, tokenizers, parsers,
-   generators) each test instantiates or looks up, expanded over the MRO.
-3. **Readers**: for every attribute/constant name, the tests that execute a line that
-   reads it, and whether it is also read at import time.
-4. **Fixture reads**: which tests open each file under `tests/`.
-
-At run time (`selector.py`), for every changed file in a patch:
-
-- edits that only touch comments or blank lines (outside strings) select nothing;
-- the patched file is rebuilt from the pinned source and compiled; a syntax error
-  selects every test;
-- each edited line is mapped to its enclosing statement (AST): statements inside
-  functions use the coverage of that statement; def headers use the function body's
-  coverage; edits inside a lambda body use that line's runtime coverage;
-- import-time statements (class attributes, module constants) select the users of the
-  class intersected with the readers of the assigned name, falling back to all users
-  of the class when the name is also consumed at import time;
-- fixture edits select the tests that read the fixture. The TPC query files are read in
-  `TestExecutor.setUpClass`, so every executor test opens them, but only three use
-  them: the patched file is parsed into (meta, sql, expected) pairs exactly as
-  `tests/helpers.load_sql_fixture_pairs` does, and only the tests that use the changed
-  parts are selected (see `TPC_PAIR_FILES`). When TPC-DS input queries change, those
-  queries are run here the way `test_execute_tpcds` runs them (sqlglot's executor vs
-  DuckDB through `subtestHelper`), and the 21 s test is kept only if one fails;
-- added/deleted/renamed modules and root config files select everything.
-
-Two run-time checks refine that (both run sqlglot inside the container, which the
-rules allow and charge as CPU):
-
-- **Import check** (`verify.import_check`): for any edit to import-time code, the
-  patched module is imported in a throwaway child (served from the patch, not the
-  disk). If importing it raises, every test is selected.
-- **Fresh-import verification** (`verify.run_fresh`): for small candidate sets after
-  an edit outside function bodies (class attributes, module constants), a child
-  imports the patched modules from the patch text, so class bodies and metaclasses
-  run again, then runs the candidate tests and keeps the failing ones. If the import
-  itself raises, every test is selected.
-- **Candidate verification** (`verify.run`): when every real edit sits inside function
-  bodies that never run at import time and the candidate tests are few and cheap, a
-  forked child swaps the patched function bodies into the live functions
-  (`func.__code__`, so dispatch tables and closures see them), runs the candidate
-  tests with unittest, and keeps only the ones that fail. It stops at the first
-  failure and keeps the remaining candidates unverified. A crash, a timeout or any
-  change that cannot be swapped keeps the full candidate set. Process pools are
-  replaced by an in-process executor that pickles arguments and results like a real
-  pool, so the patched code is what runs.
-
-- **TPC executor tests** (`test_execute_tpcds` 21 s, `test_execute_tpch`,
-  `test_optimized_tpch`): they run end-to-end over the same optimizer and executor
-  code as many cheap tests. When they are candidates, the cheapest other candidates
-  (at least 5, up to 2.5 s of recorded time) run here first as detectors. If any
-  detector fails, every candidate is kept. If all pass, the TPC executor tests are
-  dropped and the remaining candidates are kept. On mutants of the pinned commit
-  (`tools/calib.py`) and the 30 samples, every break the TPC executor tests caught
-  also broke many cheap candidates. Property tests (memory leak, AST node limit) are
-  never dropped this way.
-
-Workers are packed longest-first for every worker count 1..8, keeping the cheapest.
-
-## Rebuilding the map
-
+```powershell
+cd C:\Users\emman\OneDrive\Desktop\codex\rwx-under120
+.\test_local.ps1
 ```
-git clone https://github.com/tobymao/sqlglot && cd sqlglot && git checkout eb11aec4be8cb2122afe713a4816662c3f0fb2fa
-pip install -r ../requirements.lock      # the labeling environment
-SKIP_INTEGRATION=0 TESTS_JSON=../sample/tests.json python ../tools/forktrace.py ../ft
-cd .. && SQLGLOT_SRC=sqlglot python tools/mkmap.py ft map sample/tests.json
-tar -czf src.tar.gz -C sqlglot $(cd sqlglot && git ls-files | grep -E '^(sqlglot|tests)/')
-```
+
+This builds a uniquely named image, runs the official sample three times with the
+competition sandbox limits, and checks each output with the original scorer.
+Reports include simulated test seconds, all selector/child CPU seconds, and total.
+Sample data is mounted separately; sample answers are never mounted into the selector.
+The public sample result does not establish the hidden practice or final result.
+
+## Submission
+
+Use a public GitHub repository and the exact commit hash, with `Dockerfile` at its
+root. The committed entry must remain under 20 MB. Submit the hash explicitly rather
+than relying on whichever commit is currently on the default branch.
+
+## Selection
+
+* Baseline maps record per-test line coverage, imports, class/attribute usage and
+  fixture reads from the pinned source. Unknown or unsupported changes fall back
+  conservatively.
+* Pure comparison-operator edits can be refined using `operand_trace.json.gz`.
+  This contains **raw baseline operands, type/descriptor facts, aliasing and the
+  original comparison result**. It contains no alternate-operator results,
+  precomputed patch answers, or operator-edit-to-failing-test tables. At runtime,
+  the actual patch is inspected and its operator is evaluated over these facts.
+* Raw tracing supports exact immutable scalars, scalar subtypes whose six rich
+  comparison descriptors are unchanged, and identity-equality objects. Unsupported,
+  incomplete, oversized, failed or asynchronous observations retain the test.
+  Observations are combined across two baseline hash seeds.
+* Eligible small candidate sets are verified against patched code in isolated
+  children. Passing candidates may be removed; failed and unrun candidates stay.
+  Partial verification retains every expensive test that was not actually run.
+* TPC fixture changes are analyzed by their input/expected-output dependencies.
+  Code probes use the complete affected query set, with conservative fallback when
+  the set cannot be checked economically or a check fails or times out.
+* The original node-limit property test stays selected when affected. A shrunken
+  proxy is not used to justify removing it.
+* Worker packing tries every count from 1 through 8 using longest-first balancing,
+  minimizing the largest recorded worker load plus two seconds per worker.
+
+Dynamic baseline maps reflect observed executions. Nondeterminism or execution
+paths not represented in those observations can still affect unseen cases. Only
+an official submission can establish an official score.
+
+## Reproduce the raw observations
+
+`tools/rawcmp_plugin.py` instruments only the **unmodified** pinned SQLGlot checkout.
+It executes each original comparison once and records its inputs and original
+result. Real process pools remain process pools; spawned workers load the recorder
+before SQLGlot, and worker observations are merged. Tests using untracked threads
+or subprocesses are excluded from deductions. The generator never evaluates
+alternate comparisons and never applies mutations.
+
+`Dockerfile.profile` installs the pinned labeling dependencies and retrieves the
+full official GitHub archive at the exact pinned commit. `rebuild_observations.ps1`
+runs the two baseline seeds and merges complete observations from passing tests.
+Challenge sample inputs/answers and profiling logs are excluded from the production image. Pinned upstream SQLGlot test fixtures remain in src.tar.gz.
+
+## Prior code and dependencies
+
+This builds on this team's existing v5.3 selector and baseline coverage-map tools.
+SQLGlot and its test/fixture sources in `src.tar.gz` are the pinned MIT-licensed
+upstream sources. Runtime libraries are DuckDB, NumPy, pandas, python-dateutil,
+pytz and tzdata at the versions pinned in `Dockerfile`/`requirements.lock`.
+`THIRD_PARTY_NOTICES.md` preserves SQLGlot's license. This project is MIT licensed.

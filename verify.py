@@ -7,6 +7,7 @@ Each patch is checked in its own forked child of a parent that imported sqlglot 
 the needed test modules once.
 """
 import gc
+from functools import lru_cache
 import json
 import os
 import pickle
@@ -14,6 +15,7 @@ import signal
 import sys
 import time
 import types
+import weakref
 import unittest
 
 
@@ -61,10 +63,15 @@ def _codes(code, out, top=True):
     return out
 
 
+@lru_cache(maxsize=32)
+def _old_code_tree(path, source):
+    return _codes(compile(source, path, 'exec', dont_inherit=True), {})
+
+
 def _plan_swaps(path, old_src, new_src):
     """Return [(qualname, old_code, new_code)] for changed function bodies, or None if
     the change touches module/class-body code (not swappable)."""
-    old = _codes(compile(old_src, path, "exec", dont_inherit=True), {})
+    old = _old_code_tree(path, old_src)
     new = _codes(compile(new_src, path, "exec", dont_inherit=True), {})
     if set(old) != set(new):
         return None
@@ -83,22 +90,33 @@ def _plan_swaps(path, old_src, new_src):
     return swaps
 
 
-def _apply(path, swaps):
+def _function_index(paths):
+    index = {}
+    for obj in gc.get_objects():
+        if type(obj) is types.FunctionType:
+            code = obj.__code__
+            if code.co_filename in paths:
+                key = (code.co_filename, code.co_qualname, code.co_firstlineno)
+                index.setdefault(key, []).append(weakref.ref(obj))
+    return index
+
+def _apply(path, swaps, function_index):
     """Swap code of live functions. Changed nested functions whose parent is also
     swapped need no live instance."""
     targets = {}
     for q, oc, nc in swaps:
         targets[(q, oc.co_firstlineno)] = nc
     hit = set()
-    for obj in gc.get_objects():
-        if type(obj) is types.FunctionType:
-            c = obj.__code__
-            if c.co_filename == path:
-                key = (c.co_qualname, c.co_firstlineno)
-                nc = targets.get(key)
-                if nc is not None:
-                    obj.__code__ = nc
-                    hit.add(key)
+    for (qualname, firstline), new_code in targets.items():
+        for reference in function_index.get((path, qualname, firstline), ()):
+            obj = reference()
+            if obj is None:
+                continue
+            code = obj.__code__
+            if (code.co_filename, code.co_qualname, code.co_firstlineno) != (path, qualname, firstline):
+                continue
+            obj.__code__ = new_code
+            hit.add((qualname, firstline))
     swapped_q = {q for (q, _l) in hit}
     for q, oc, nc in swaps:
         if (q, oc.co_firstlineno) in hit:
@@ -113,6 +131,7 @@ class _Result(unittest.TestResult):
     def __init__(self):
         super().__init__()
         self.bad = False
+        self.failfast = True
 
     def addSubTest(self, test, subtest, err):
         if err is not None:
@@ -139,6 +158,7 @@ def run(jobs, ids, src_root, deadline, log):
         for rel in files:
             importlib.import_module(rel[:-3].replace("/", "."))
     gc.collect()
+    function_index = _function_index({os.path.join(src_root, rel) for _, files, _, _ in jobs for rel in files})
     import resource
     ru = resource.getrusage(resource.RUSAGE_SELF)
     log("verify: parent setup cpu %.3f" % (ru.ru_utime + ru.ru_stime))
@@ -160,7 +180,7 @@ def run(jobs, ids, src_root, deadline, log):
                     with open(path, encoding="utf-8") as fh:
                         old_src = fh.read()
                     swaps = _plan_swaps(path, old_src, new_src)
-                    if swaps is None or not _apply(path, swaps):
+                    if swaps is None or not _apply(path, swaps, function_index):
                         ok = False
                         break
                 failed, unrun = [], []
