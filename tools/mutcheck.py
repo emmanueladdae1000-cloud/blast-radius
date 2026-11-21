@@ -41,7 +41,9 @@ def main(seed, count, filt):
     while done < count:
         rel = rng.choice(files)
         src = open(os.path.join(ORIG, rel)).read().splitlines(keepends=True)
+        if not src: continue
         i = rng.randrange(len(src)); line = src[i]
+        if os.environ.get("CLASSY") and not re.match(r"^    (    )?[A-Z_]{3,}[A-Za-z_]* *(:.*)?= ", line): continue
         if line.strip().startswith("#") or not line.strip(): continue
         new = mutate_line(line, rng)
         if not new or new == line: continue

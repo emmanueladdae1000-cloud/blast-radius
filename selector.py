@@ -35,6 +35,7 @@ class Maps:
         self.usage = m["usage"]
         self.fixtures = m["fixtures"]
         self.gsets = m["sets"]
+        self.eager = set(m.get("eager", []))
         self.all = set(range(len(self.ids)))
         self._src = {}
 
@@ -254,10 +255,15 @@ class Selector:
     def classes_in(self, d):
         return [s[6] for s in d["stmts"] if s[3] == "k"]
 
-    def reader_tests(self, name):
+    def reader_tests(self, name, rel=None):
+        """Tests that read `name` at run time, and whether it is also read at import
+        time in a way that could see a class defined in module `rel` (lazily loaded
+        modules are created after `import sqlglot`, so only later reads count)."""
         r = self.m.readers.get(name)
         if r is None:
             return None, True
+        if rel is not None and len(r) > 2 and self.module_of(rel).removesuffix(".__init__") not in self.m.eager:
+            return set(self.m.gset(r[0])), bool(r[2])
         return set(self.m.gset(r[0])), bool(r[1])
 
     def file_users(self, rel, d):
@@ -472,7 +478,7 @@ class Selector:
                 rd = set()
                 safe = True
                 for n in tg:
-                    r, unsafe = self.reader_tests(n)
+                    r, unsafe = self.reader_tests(n, rel)
                     if r is None or unsafe:
                         safe = False
                         break
@@ -520,7 +526,7 @@ class Selector:
     def select(self, text):
         out = set()
         notes = []
-        self.verify = {"ok": True, "src": {}}
+        self.verify = {"ok": True, "src": {}, "fresh_ok": True, "allsrc": {}}
         self.importcheck = {}
         for ch in parse_patch(text):
             old, new = ch["old"], ch["new"]
@@ -557,6 +563,11 @@ class Selector:
                     self.verify["ok"] = False
                 elif self.vsrc is not None and t:
                     self.verify["src"][rel] = self.vsrc
+                if why != "comment":
+                    if self.vsrc is None or not rel.startswith("sqlglot/") or why in ("syntax", "apply-failed"):
+                        self.verify["fresh_ok"] = False
+                    else:
+                        self.verify["allsrc"][rel] = self.vsrc
                 continue
             elif rel.startswith("tests/fixtures/"):
                 t, why = self.fixture_change(rel)
@@ -576,6 +587,7 @@ class Selector:
             head = n.split(":")[0]
             if not (head.endswith(".py") or n.startswith("mode-only") or n.startswith("ignored:")):
                 self.verify["ok"] = False
+                self.verify["fresh_ok"] = False
         return out, notes
 
 
@@ -605,10 +617,11 @@ HEAVY_CLASSES = {"tests/test_executor.py::TestExecutor"}
 # tests that start a fresh interpreter (they would see the unpatched files)
 NO_VERIFY = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
 SUBPROCESS_IMPORT_TESTS = NO_VERIFY
-V_MAX_MS = int(os.environ.get("BR_V_MAX_MS", "4000"))      # total recorded ms of a verified set
+V_MAX_MS = int(os.environ.get("BR_V_MAX_MS", "2000"))      # total recorded ms of a verified set
 V_MAX_TEST_MS = int(os.environ.get("BR_V_MAX_TEST_MS", "1500"))
 V_MAX_TESTS = int(os.environ.get("BR_V_MAX_TESTS", "120"))
 V_BUDGET_S = float(os.environ.get("BR_V_BUDGET_S", "90"))
+V_FRESH_MAX_MS = int(os.environ.get("BR_V_FRESH_MAX_MS", "1500"))
 
 
 def main():
@@ -631,6 +644,7 @@ def main():
     cdir = os.path.join(DATA, "commits")
     results = []   # [cid, nums, notes]
     jobs = []
+    fresh = []
     ichecks = []
     names = sorted(n for n in os.listdir(cdir) if n.endswith(".patch"))
     for name in names:
@@ -642,16 +656,21 @@ def main():
             nums = {num_of[maps.ids[t]] for t in tset if maps.ids[t] in num_of}
             if tset == maps.all:
                 nums |= set(unknown)
-            if sel.importcheck:
-                ichecks.append((len(results), dict(sel.importcheck)))
             v = sel.verify
-            if VERIFY and v["ok"] and v["src"] and tset and len(tset) <= V_MAX_TESTS:
+            fresh_job = False
+            if VERIFY and tset and tset != maps.all and len(tset) <= V_MAX_TESTS:
                 tl = sorted(tset, key=lambda t: (ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6), t))
                 tot = sum(ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6) for t in tl)
                 heavy = any("::".join(maps.ids[t].split("::")[:2]) in HEAVY_CLASSES or maps.ids[t] in NO_VERIFY for t in tl)
                 big = any(ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6) > V_MAX_TEST_MS for t in tl)
                 if not heavy and not big and tot <= V_MAX_MS:
-                    jobs.append((len(results), v["src"], tl, 4.0 + 4.0 * tot / 1000.0))
+                    if v["ok"] and v["src"] and not sel.importcheck:
+                        jobs.append((len(results), v["src"], tl, 4.0 + 4.0 * tot / 1000.0))
+                    elif v["fresh_ok"] and v["allsrc"] and tot <= V_FRESH_MAX_MS:
+                        fresh.append((len(results), dict(v["allsrc"]), tl, 6.0 + 4.0 * tot / 1000.0))
+                        fresh_job = True
+            if sel.importcheck and not fresh_job:
+                ichecks.append((len(results), dict(sel.importcheck)))
         except Exception as e:  # never crash: run everything for this commit
             log("error", cid, repr(e))
             nums = set(ms_of)
@@ -668,6 +687,29 @@ def main():
         except Exception as e:
             log("importcheck error", repr(e))
             for key, files in ichecks:
+                results[key][1] = set(ms_of)
+    if fresh:
+        try:
+            import verify
+            done = verify.run_fresh(fresh, maps.ids, SRC, V_BUDGET_S / 2, log)
+            for key, files, _, _ in fresh:
+                res = done.get(key)
+                if res is None:
+                    # not verified: still make sure the patched modules import
+                    if not verify.import_check(SRC, files, log):
+                        results[key][1] = set(ms_of)
+                        results[key][2] = results[key][2] + ["import-broken-all"]
+                elif res[0] == "broken":
+                    results[key][1] = set(ms_of)
+                    results[key][2] = results[key][2] + ["import-broken-all"]
+                else:
+                    failed, unrun = res
+                    keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
+                    results[key][2] = results[key][2] + [f"fresh-verified:{len(results[key][1])}->{len(keep)}"]
+                    results[key][1] = keep
+        except Exception as e:
+            log("verify-fresh error", repr(e))
+            for key, _, _, _ in fresh:
                 results[key][1] = set(ms_of)
     if jobs:
         try:

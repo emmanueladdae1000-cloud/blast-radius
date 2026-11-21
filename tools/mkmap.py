@@ -29,12 +29,17 @@ def add_seen(seen, tset, m):
     for c in seen:
         for b in m.get(c, [c]):
             users[b] |= tset
-imp = json.load(open(f"{FT}/_import.json"))
-implines = defaultdict(set)
-for f, l in imp["lines"]:
+imp = json.load(open(f"{FT}/_import.json"))        # phase 2: lazily loaded modules
+imp1 = json.load(open(f"{FT}/_import1.json"))      # phase 1: `import sqlglot`
+eager = imp1["eager"]
+implines = defaultdict(set)      # any import-time execution
+implines2 = defaultdict(set)     # import-time execution after `import sqlglot`
+for f, l in imp1["lines"]:
     implines[f].add(l)
+for f, l in imp["lines"]:
+    implines[f].add(l); implines2[f].add(l)
 implams = defaultdict(set)
-for f, l in imp.get("lams", []):
+for f, l in imp.get("lams", []) + imp1.get("lams", []):
     implams[f].add(l)
 for path in glob.glob(f"{FT}/t*.json"):
     n = int(os.path.basename(path)[1:-5]); d = json.load(open(path))
@@ -109,14 +114,15 @@ def sid(s):
     return gid[key]
 readers = {}
 for name in wanted:
-    s = set(); unsafe = False
+    s = set(); unsafe = False; unsafe2 = False
     for f, l in names_lines.get(name, ()):
         s |= cov.get(f, {}).get(l, set())
         if l in implines.get(f, ()): unsafe = True
-    readers[name] = [sid(s), 1 if unsafe else 0]
+        if l in implines2.get(f, ()): unsafe2 = True
+    readers[name] = [sid(s), 1 if unsafe else 0, 1 if unsafe2 else 0]
 usage = {c: sid(s) for c, s in users.items()}
 fixtures = {p: sorted(s) for p, s in reads.items()}
-json.dump({"tests": ids, "testfile": testfile, "testclass": testclass, "readers": readers, "usage": usage,
+json.dump({"eager": eager, "tests": ids, "testfile": testfile, "testclass": testclass, "readers": readers, "usage": usage,
            "fixtures": fixtures, "sets": gsets}, gzip.open(os.path.join(OUT, "meta.json.gz"), "wt"), separators=(",", ":"))
 tot = sum(os.path.getsize(p) for p in glob.glob(OUT + "/**", recursive=True) if os.path.isfile(p))
 print("map bytes", tot, "readers", len(readers), "usage", len(usage), "gsets", len(gsets))

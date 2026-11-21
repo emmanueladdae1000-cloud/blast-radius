@@ -40,6 +40,11 @@ rules allow and charge as CPU):
 - **Import check** (`verify.import_check`): for any edit to import-time code, the
   patched module is imported in a throwaway child (served from the patch, not the
   disk). If importing it raises, every test is selected.
+- **Fresh-import verification** (`verify.run_fresh`): for small candidate sets after
+  an edit outside function bodies (class attributes, module constants), a child
+  imports the patched modules from the patch text, so class bodies and metaclasses
+  run again, then runs the candidate tests and keeps the failing ones. If the import
+  itself raises, every test is selected.
 - **Candidate verification** (`verify.run`): when every real edit sits inside function
   bodies that never run at import time and the candidate tests are few and cheap, a
   forked child swaps the patched function bodies into the live functions

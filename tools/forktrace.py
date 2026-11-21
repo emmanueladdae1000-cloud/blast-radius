@@ -101,6 +101,11 @@ def dump(name, obj):
 # ---- phase A: import all of sqlglot
 start()
 import sqlglot
+eager = sorted(m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot."))
+_lams1 = sorted(LAMS)
+dump("_import1.json", {"lines": stop(), "lams": _lams1, "eager": eager})
+LAMS.clear()
+start()   # phase 2: everything sqlglot loads lazily (events restarted, so shared lines count again)
 failed = []
 for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
     try:

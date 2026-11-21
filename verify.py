@@ -164,27 +164,7 @@ def run(jobs, ids, src_root, budget_s, log):
                         break
                 failed, unrun = [], []
                 if ok:
-                    setup_done = set()
-                    for i, t in enumerate(order):
-                        f, c, m = ids[t].split("::")
-                        mod = mods.get(f)
-                        if mod is None:
-                            unrun = order[i:]
-                            break
-                        cls = getattr(mod, c)
-                        if c not in setup_done:
-                            setup_done.add(c)
-                            try:
-                                cls.setUpClass()
-                            except BaseException:
-                                unrun = order[i:]
-                                break
-                        r = _Result()
-                        cls(m).run(r)
-                        if r.bad or r.failures or r.errors or r.unexpectedSuccesses:
-                            failed.append(t)
-                            unrun = order[i + 1:]   # stop: the commit needs a worker anyway
-                            break
+                    failed, unrun = _run_tests(order, ids, mods)
                     with open(out, "w") as fh:
                         json.dump({"failed": failed, "unrun": unrun}, fh)
                     code = 0
@@ -228,6 +208,167 @@ def run(jobs, ids, src_root, budget_s, log):
     return results
 
 
+def _install_finder(src_root, files):
+    import importlib.abc
+    import importlib.util
+
+    mods = {rel[:-3].replace("/", ".").removesuffix(".__init__"): (rel, src) for rel, src in files.items()}
+
+    class Loader(importlib.abc.SourceLoader):
+        def __init__(self, name):
+            self.name = name
+
+        def get_filename(self, fullname):
+            return os.path.join(src_root, mods[fullname][0])
+
+        def get_data(self, path):
+            for rel, src in mods.values():
+                if path == os.path.join(src_root, rel):
+                    return src.encode("utf-8")
+            with open(path, "rb") as fh:
+                return fh.read()
+
+        def path_stats(self, path):
+            raise OSError  # never use a cached .pyc for the patched module
+
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname in mods:
+                rel = mods[fullname][0]
+                fn = os.path.join(src_root, rel)
+                is_pkg = rel.endswith("__init__.py")
+                return importlib.util.spec_from_file_location(
+                    fullname, fn, loader=Loader(fullname),
+                    submodule_search_locations=[os.path.dirname(fn)] if is_pkg else None)
+            return None
+
+    sys.meta_path.insert(0, Finder())
+    return mods
+
+
+def _import_patched(mods):
+    """Import sqlglot and each patched module; build dialect classes they belong to."""
+    import importlib
+    import sqlglot  # noqa: F401
+    for name in mods:
+        importlib.import_module(name)
+        if name.startswith(("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.", "sqlglot.typing.")):
+            d = name.rsplit(".", 1)[1]
+            from sqlglot.dialects.dialect import Dialect
+            try:
+                dia = Dialect.get_or_raise(d)
+            except ValueError:
+                dia = None
+            if dia is not None:
+                dia.tokenizer_class, dia.parser_class, dia.generator_class
+
+
+def _wait(pid, timeout):
+    deadline = time.time() + timeout
+    while True:
+        r_pid, st = os.waitpid(pid, os.WNOHANG)
+        if r_pid:
+            return st
+        if time.time() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            return None
+        time.sleep(0.002)
+
+
+def _run_tests(order, ids, mods_by_file):
+    failed, unrun = [], []
+    setup_done = set()
+    for i, t in enumerate(order):
+        f, c, m = ids[t].split("::")
+        mod = mods_by_file.get(f)
+        if mod is None:
+            return failed, order[i:]
+        cls = getattr(mod, c)
+        if c not in setup_done:
+            setup_done.add(c)
+            try:
+                cls.setUpClass()
+            except BaseException:
+                return failed, order[i:]
+        r = _Result()
+        cls(m).run(r)
+        if r.bad or r.failures or r.errors or r.unexpectedSuccesses:
+            failed.append(t)
+            return failed, order[i + 1:]
+    return failed, unrun
+
+
+def run_fresh(jobs, ids, src_root, budget_s, log):
+    """Verification for edits outside function bodies: each job runs in a child that
+    imports the patched modules from the patch text (class bodies and metaclasses run
+    again), then the candidate tests. Returns {key: ("broken", None) | (failed, unrun)}."""
+    import importlib
+    t_start = time.time()
+    results = {}
+    # third-party libraries the test modules need do not depend on sqlglot: import
+    # them once here so every forked child shares them.
+    need = {ids[t].split("::")[0] for _, _, order, _ in jobs for t in order}
+    if need & {"tests/test_optimizer.py", "tests/test_executor.py", "tests/test_schema.py"}:
+        try:
+            import duckdb  # noqa: F401
+            import numpy  # noqa: F401
+            import pandas  # noqa: F401
+            import pandas.testing  # noqa: F401
+        except BaseException:
+            pass
+    import unittest.mock  # noqa: F401
+    for key, files, order, tmo in jobs:
+        if time.time() - t_start > budget_s:
+            log("verify-fresh: budget exhausted")
+            break
+        out = os.path.join("/tmp", f"vf_{os.getpid()}_{key}.json")
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                _setup(src_root)
+                mods = _install_finder(src_root, files)
+                try:
+                    _import_patched(mods)
+                except BaseException as e:
+                    sys.stderr.write("verify-fresh: import broken %r\n" % (e,))
+                    with open(out, "w") as fh:
+                        json.dump({"broken": True}, fh)
+                    os._exit(0)
+                by_file = {}
+                for f in sorted({ids[t].split("::")[0] for t in order}):
+                    try:
+                        by_file[f] = importlib.import_module(f[:-3].replace("/", "."))
+                    except BaseException:
+                        pass
+                failed, unrun = _run_tests(order, ids, by_file)
+                with open(out, "w") as fh:
+                    json.dump({"failed": failed, "unrun": unrun}, fh)
+                code = 0
+            except BaseException:
+                code = 1
+            finally:
+                os._exit(code)
+        st = _wait(pid, tmo)
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_now = ru.ru_utime + ru.ru_stime
+        log("verify-fresh: job %s cpu %.3f" % (key, cpu_now - getattr(run_fresh, "_last", 0.0)))
+        run_fresh._last = cpu_now
+        if st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 and os.path.exists(out):
+            with open(out) as fh:
+                d = json.load(fh)
+            results[key] = ("broken", None) if d.get("broken") else (d["failed"], d["unrun"])
+        else:
+            log("verify-fresh: not verified", key)
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+    return results
+
+
 def import_check(src_root, files, log, timeout=30.0):
     """Import the patched modules (and sqlglot) in a throwaway child. False if that raises."""
     pid = os.fork()
@@ -236,52 +377,7 @@ def import_check(src_root, files, log, timeout=30.0):
         try:
             os.environ["SKIP_INTEGRATION"] = "0"
             sys.path.insert(0, src_root)
-            import importlib.abc
-            import importlib.util
-
-            mods = {rel[:-3].replace("/", ".").removesuffix(".__init__"): (rel, src) for rel, src in files.items()}
-
-            class Loader(importlib.abc.SourceLoader):
-                def __init__(self, name):
-                    self.name = name
-
-                def get_filename(self, fullname):
-                    return os.path.join(src_root, mods[fullname][0])
-
-                def get_data(self, path):
-                    for rel, src in mods.values():
-                        if path == os.path.join(src_root, rel):
-                            return src.encode("utf-8")
-                    with open(path, "rb") as fh:
-                        return fh.read()
-
-                def path_stats(self, path):
-                    raise OSError  # never use a cached .pyc for the patched module
-
-            class Finder(importlib.abc.MetaPathFinder):
-                def find_spec(self, fullname, path, target=None):
-                    if fullname in mods:
-                        rel = mods[fullname][0]
-                        fn = os.path.join(src_root, rel)
-                        is_pkg = rel.endswith("__init__.py")
-                        return importlib.util.spec_from_file_location(
-                            fullname, fn, loader=Loader(fullname),
-                            submodule_search_locations=[os.path.dirname(fn)] if is_pkg else None)
-                    return None
-
-            sys.meta_path.insert(0, Finder())
-            import sqlglot  # noqa: F401
-            for name in mods:
-                importlib.import_module(name)
-                if name.startswith(("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.", "sqlglot.typing.")):
-                    d = name.rsplit(".", 1)[1]
-                    from sqlglot.dialects.dialect import Dialect
-                    try:
-                        dia = Dialect.get_or_raise(d)
-                    except ValueError:
-                        dia = None
-                    if dia is not None:
-                        dia.tokenizer_class, dia.parser_class, dia.generator_class
+            _import_patched(_install_finder(src_root, files))
             code = 0
         except BaseException as e:
             try:
@@ -291,17 +387,8 @@ def import_check(src_root, files, log, timeout=30.0):
             code = 4
         finally:
             os._exit(code)
-    deadline = time.time() + timeout
-    while True:
-        r_pid, st = os.waitpid(pid, os.WNOHANG)
-        if r_pid:
-            ok = os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0
-            if not ok:
-                log("importcheck failed", sorted(files))
-            return ok
-        if time.time() > deadline:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            log("importcheck timeout", sorted(files))
-            return False
-        time.sleep(0.002)
+    st = _wait(pid, timeout)
+    ok = st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0
+    if not ok:
+        log("importcheck failed", sorted(files))
+    return ok
