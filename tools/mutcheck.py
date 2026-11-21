@@ -1,5 +1,7 @@
 """Generate random single-line mutations, compare selector output vs real pytest failures."""
 import random, re, os, sys, json, subprocess, difflib, ast
+sys.path.insert(0, "/home/claude/work/tools")
+from junit import failed_ids
 sys.path.insert(0, "/home/claude/work/repo")
 os.environ["BR_SRC"] = "/home/claude/work/sqlglot"
 import selector
@@ -24,13 +26,20 @@ def mutate_line(line, rng):
     return line[:m.start()] + rep + line[m.end():]
 def run_suite():
     env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "2", "-rfE",
-                        "--timeout", "120", "tests"], cwd=MUT, capture_output=True, text=True, env=env)
+    try:
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "2", "-rfE", "--junitxml=/tmp/jx_%d.xml" % os.getpid(),
+                            "--max-worker-restart", "1", "--timeout", "120", "tests"], cwd=MUT, capture_output=True,
+                           text=True, env=env, timeout=420)
+    except subprocess.TimeoutExpired:
+        return None, "suite-timeout"
     fails = set()
     for line in r.stdout.splitlines():
         if line.startswith(("FAILED", "ERROR", "SUBFAILED")):
             m = re.search(r"(tests/\S+?::\w+::\w+)", line)
             if m and m.group(1) in num: fails.add(num[m.group(1)])
+    _j = failed_ids("/tmp/jx_%d.xml" % os.getpid())
+    if _j is not None:
+        fails = {num[i] for i in _j if i in num}
     tail = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:]
     return fails, tail
 def main(seed, count, filt):
@@ -66,6 +75,8 @@ def main(seed, count, filt):
             F, tail = run_suite()
         finally:
             open(os.path.join(MUT, rel), "w").writelines(src)
+        if F is None:
+            continue
         miss = F - Cn
         print(json.dumps({"file": rel, "line": i + 1, "old": line.strip()[:80], "new": new.strip()[:80],
                           "F": len(F), "C": len(Cn), "miss": sorted(miss), "notes": notes, "tail": tail[-80:]}), flush=True)

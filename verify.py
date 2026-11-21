@@ -384,3 +384,58 @@ def import_check(src_root, files, log, timeout=30.0):
     if not ok:
         log("importcheck failed", sorted(files))
     return ok
+
+
+def tpcds_probe(src_root, pairs, changed, deadline, log):
+    """Run the edited TPC-DS queries exactly as test_execute_tpcds does (parse, execute
+    with sqlglot's executor, compare with DuckDB through subtestHelper). True only if
+    every edited query passes; the other 98 queries are unchanged."""
+    tmo = deadline - time.time()
+    if tmo < 5:
+        return False
+    out = os.path.join("/tmp", f"tp_{os.getpid()}.json")
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            _setup(src_root)
+            from sqlglot import parse_one
+            import tests.test_executor as te
+
+            def rt(x):
+                return pickle.loads(pickle.dumps(x))
+
+            te.TestExecutor.setUpClass()
+            te.TestExecutor.tpcds_sqls = [tuple(p) for p in pairs]
+
+            class Probe(te.TestExecutor):
+                def runTest(self):
+                    exprs = [parse_one(self.tpcds_sqls[i][1]) for i in changed]
+                    te.initializer(te.TPCDS_SCHEMA, self.tpcds_tables)
+                    for i, e in zip(changed, exprs):
+                        args = self.tpcds_sqls[i][0]
+                        table = rt(te.mp_execute(rt(e), rt(args)))
+                        if table is not None:
+                            self.subtestHelper(i, table, tpch=False)
+
+            r = _Result()
+            Probe().run(r)
+            ok = not (r.bad or r.failures or r.errors)
+            with open(out, "w") as fh:
+                json.dump({"ok": ok}, fh)
+            code = 0
+        except BaseException:
+            code = 1
+        finally:
+            os._exit(code)
+    st = _wait(pid, tmo)
+    ok = False
+    if st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 and os.path.exists(out):
+        with open(out) as fh:
+            ok = bool(json.load(fh).get("ok"))
+    try:
+        os.remove(out)
+    except OSError:
+        pass
+    log("tpcds-probe", changed, "pass" if ok else "fail/unknown")
+    return ok

@@ -16,6 +16,25 @@ MAP = os.path.join(HERE, "map")
 DATA = os.environ.get("BR_DATA", "/data")
 SRC = os.environ.get("BR_SRC", os.path.join(HERE, "src"))  # pinned sqlglot sources (optional)
 
+# Which tests use which part of the TPC query pairs (tests/test_executor.py and
+# tests/test_optimizer.py at the pinned commit):
+#  test_execute_tpc{h,ds}: pool.submit(mp_execute, parse_one(sql), args) -> meta + sql
+#  test_optimized_tpch:    cached_execute(sql) vs transpile(optimized)    -> sql + expected
+#  TestOptimizer.test_tpc{h,ds}: check_file(...)                          -> everything
+TPC_PAIR_FILES = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {
+        "any": ["tests/test_optimizer.py::TestOptimizer::test_tpcds"],
+        "meta_sql": ["tests/test_executor.py::TestExecutor::test_execute_tpcds"],
+        "sql_expected": [],
+        "probe": "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    },
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {
+        "any": ["tests/test_optimizer.py::TestOptimizer::test_tpch"],
+        "meta_sql": ["tests/test_executor.py::TestExecutor::test_execute_tpch"],
+        "sql_expected": ["tests/test_executor.py::TestExecutor::test_optimized_tpch"],
+    },
+}
+TPC_PROBE_MAX = int(os.environ.get("BR_TPC_PROBE_MAX", "6"))
 LAZY_LOAD_FILES = {"sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"}
 ROOT_CONFIG = {"pyproject.toml", "setup.cfg", "setup.py", "conftest.py", "tox.ini", "pytest.ini", "Makefile"}
 
@@ -173,6 +192,25 @@ def apply_hunks(orig_lines, hunks):
             else:
                 out.append(text + "\n")
     out.extend(orig_lines[pos:])
+    return out
+
+
+def fixture_pairs(text):
+    """Same result as tests/helpers.py load_sql_fixture_pairs (pinned commit)."""
+    s = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")])
+    statements = s.split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql = statements[i].strip()
+            lines = sql.split("\n")
+            meta = {}
+            j = 0
+            while lines[j].startswith("#"):
+                key, val = lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            out.append((meta, "\n".join(lines[j:]), statements[i + 1].strip()))
     return out
 
 
@@ -507,7 +545,11 @@ class Selector:
     def syntax_broken(self, rel, d):
         return set(self.m.all)
 
-    def fixture_change(self, rel):
+    def fixture_change(self, rel, ch=None):
+        if ch is not None and rel in TPC_PAIR_FILES and ch.get("hunks") and not ch.get("binary"):
+            r = self.tpc_pairs_change(rel, ch)
+            if r is not None:
+                return r
         t = self.m.fixtures.get(rel)
         if t is not None:
             return set(t), "fixture"
@@ -523,12 +565,57 @@ class Selector:
                 return set(self.m.all), "fixture-unknown-all"
         return out, "fixture-unknown"
 
+    def tpc_pairs_change(self, rel, ch):
+        """TPC query files are loaded in TestExecutor.setUpClass, so every executor test
+        "reads" them; only three use them. Parse the (meta, sql, expected) pairs before
+        and after the patch exactly as tests/helpers.load_sql_fixture_pairs does, and
+        select the tests that use the parts that changed."""
+        path = os.path.join(SRC, rel)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                orig = fh.readlines()
+        except OSError:
+            return None
+        new = apply_hunks(orig, ch["hunks"])
+        if new is None:
+            return None
+        try:
+            a = fixture_pairs("".join(orig))
+            b = fixture_pairs("".join(new))
+        except Exception:
+            return None   # parse failure would break setUpClass: keep every reader
+        if len(a) != len(b):
+            return None
+        meta_sql = expected = False
+        for (m1, s1, e1), (m2, s2, e2) in zip(a, b):
+            if m1 != m2 or s1 != s2:
+                meta_sql = True
+            if s1 != s2 or e1 != e2:
+                expected = True
+        if not (meta_sql or expected):
+            return set(), "tpc-noop"
+        spec = TPC_PAIR_FILES[rel]
+        changed_sql = [i for i, (x, y) in enumerate(zip(a, b)) if x[0] != y[0] or x[1] != y[1]]
+        if spec.get("probe") and changed_sql:
+            self.tpc_probe_candidate = (spec["probe"], [list(p) for p in b], changed_sql)
+        idx = {i: n for n, i in enumerate(self.m.ids)}
+        want = list(spec["any"])
+        if meta_sql:
+            want += spec["meta_sql"]
+        if expected:
+            want += spec["sql_expected"]
+        return {idx[i] for i in want if i in idx}, "tpc-pairs" + (":sql" if meta_sql else "") + (":exp" if expected else "")
+
     def select(self, text):
         out = set()
         notes = []
         self.verify = {"ok": True, "src": {}, "fresh_ok": True, "allsrc": {}}
         self.importcheck = {}
+        self.tpc_probe_candidate = None
+        self.tpc_probe = None
+        n_files = 0
         for ch in parse_patch(text):
+            n_files += 1
             old, new = ch["old"], ch["new"]
             rel = old or new
             if ch.get("binary") and rel.endswith(".py"):
@@ -570,7 +657,7 @@ class Selector:
                         self.verify["allsrc"][rel] = self.vsrc
                 continue
             elif rel.startswith("tests/fixtures/"):
-                t, why = self.fixture_change(rel)
+                t, why = self.fixture_change(rel, ch)
                 out |= t
                 notes.append(why)
             elif os.path.basename(rel) in ROOT_CONFIG and "/" not in rel:
@@ -583,6 +670,8 @@ class Selector:
                 notes.append("tests-data:" + why)
             else:
                 notes.append("ignored:" + rel)
+        if n_files == 1 and self.tpc_probe_candidate and len(self.tpc_probe_candidate[2]) <= TPC_PROBE_MAX:
+            self.tpc_probe = self.tpc_probe_candidate
         for n in notes:
             head = n.split(":")[0]
             if not (head.endswith(".py") or n.startswith("mode-only") or n.startswith("ignored:")):
@@ -662,6 +751,7 @@ def main():
     jobs = []
     fresh = []
     ichecks = []
+    probes = []    # TPC-DS query edits: run the edited queries the way test_execute_tpcds does
     special = {}   # key -> tests to keep when every cheap candidate passed (heavy skip)
     names = sorted(n for n in os.listdir(cdir) if n.endswith(".patch"))
     for name in names:
@@ -714,6 +804,8 @@ def main():
                         else:
                             fresh.append((len(results), dict(v["allsrc"]), run, 8.0 + 3.0 * runtot / 1000.0))
                             fresh_job = True
+            if VERIFY and sel.tpc_probe:
+                probes.append((len(results), sel.tpc_probe))
             if sel.importcheck and not fresh_job:
                 ichecks.append((len(results), dict(sel.importcheck)))
         except Exception as e:  # never crash: run everything for this commit
@@ -733,6 +825,18 @@ def main():
             log("importcheck error", repr(e))
             for key, files in ichecks:
                 results[key][1] = set(ms_of)
+    if probes:
+        try:
+            import verify
+            for key, (test_id, pairs, changed) in probes:
+                ok = verify.tpcds_probe(SRC, pairs, changed, t0 + V_DEADLINE_S * 0.5, log)
+                if ok and test_id in num_of:
+                    results[key][1] = set(results[key][1]) - {num_of[test_id]}
+                    results[key][2] = results[key][2] + ["tpcds-probe-pass"]
+                else:
+                    results[key][2] = results[key][2] + ["tpcds-probe-kept"]
+        except Exception as e:
+            log("probe error", repr(e))
     if fresh:
         try:
             import verify

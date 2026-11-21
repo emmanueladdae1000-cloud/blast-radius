@@ -1,6 +1,8 @@
 """Calibrate: when heavy test H fails on a mutant, does some cheap candidate fail too?"""
 import random, re, os, sys, json, subprocess, difflib, gzip
 sys.path.insert(0, "/home/claude/work/tools")
+from junit import failed_ids
+sys.path.insert(0, "/home/claude/work/tools")
 from mutcheck import mutate_line
 ORIG = "/home/claude/work/sqlglot"; MUT = "/home/claude/work/mut/sqlglot"
 T = json.load(open("/home/claude/kit/sample/tests.json"))["tests"]
@@ -48,7 +50,7 @@ def main(seed, count):
         try:
             nodes = [byn[n]["id"] for n in sorted(C)]
             open("/tmp/cb/nodes.txt", "w").write("\n".join(nodes))
-            p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "2", "-rfE", "--timeout", "300"] + nodes,
+            p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "2", "-rfE", "--junitxml=/tmp/jx_%d.xml" % os.getpid(), "--timeout", "300"] + nodes,
                                cwd=MUT, capture_output=True, text=True, env=dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1"))
         finally:
             open(os.path.join(MUT, rel), "w").writelines(src)
@@ -57,6 +59,9 @@ def main(seed, count):
             if l.startswith(("FAILED", "ERROR", "SUBFAILED")):
                 m = re.search(r"(tests/\S+?::\w+::\w+)", l)
                 if m and m.group(1) in num: F.add(num[m.group(1)])
+        _j = failed_ids("/tmp/jx_%d.xml" % os.getpid())
+        if _j is not None:
+            F = {num[i] for i in _j if i in num}
         hf = num[ids[H]] in F
         cheap_fail = sorted(F - HEAVY)
         cheapC = sum(byn[n]["seconds"] for n in C - HEAVY)

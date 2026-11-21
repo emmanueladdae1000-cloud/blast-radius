@@ -31,7 +31,13 @@ At run time (`selector.py`), for every changed file in a patch:
 - import-time statements (class attributes, module constants) select the users of the
   class intersected with the readers of the assigned name, falling back to all users
   of the class when the name is also consumed at import time;
-- fixture edits select the tests that read the fixture;
+- fixture edits select the tests that read the fixture. The TPC query files are read in
+  `TestExecutor.setUpClass`, so every executor test opens them, but only three use
+  them: the patched file is parsed into (meta, sql, expected) pairs exactly as
+  `tests/helpers.load_sql_fixture_pairs` does, and only the tests that use the changed
+  parts are selected (see `TPC_PAIR_FILES`). When TPC-DS input queries change, those
+  queries are run here the way `test_execute_tpcds` runs them (sqlglot's executor vs
+  DuckDB through `subtestHelper`), and the 21 s test is kept only if one fails;
 - added/deleted/renamed modules and root config files select everything.
 
 Two run-time checks refine that (both run sqlglot inside the container, which the
