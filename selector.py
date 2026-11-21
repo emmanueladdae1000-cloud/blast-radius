@@ -909,6 +909,13 @@ def main():
         for r in results:
             if commit_category(r[2]) == probe:
                 r[1] = set()
+    # Measurement probe (practice board only): drop two slow tests everywhere. The board's
+    # simulated seconds and miss count then show how often they are selected and how often they fail.
+    drop_ids = {"tests/test_parser.py::TestParser::test_max_nodes",
+                "tests/test_executor.py::TestExecutor::test_execute_tpcds"}
+    drop_nums = {num_of[i] for i in drop_ids if i in num_of}
+    for r in results:
+        r[1] = set(r[1]) - drop_nums
     cats = {}
     for r in results:
         c = commit_category(r[2])
