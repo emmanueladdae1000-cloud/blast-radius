@@ -254,6 +254,10 @@ def tpcds_queries(patch_text, src_root):
     out_files = {}
     q = set()
     for rel, info in files.items():
+        if rel.startswith("tests/fixtures/") and not rel.endswith(".py"):
+            if rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
+                return None  # the TPC-DS test reads these: the fixture logic handles them
+            continue  # test_execute_tpcds reads no other fixture
         if not rel.endswith(".py") or not rel.startswith("sqlglot/"):
             return None
         if info["is_new"] or info["is_deleted"] or info["is_binary"] or not info["hunks"]:
@@ -285,14 +289,17 @@ def tpcds_queries(patch_text, src_root):
     return out_files, sorted(q)
 
 
-def code_patch_files(patch_text, src_root):
+def code_patch_files(patch_text, src_root, allow_fixtures=False):
     """{rel: patched source} for a patch that only edits existing sqlglot/*.py files with at least one
-    non-comment change; None otherwise."""
+    non-comment change (plus, with allow_fixtures, non-Python files under tests/fixtures/, which are
+    left out of the result); None otherwise."""
     files = parse_unified_diff(patch_text)
     if not files:
         return None
     out = {}
     for rel, info in files.items():
+        if allow_fixtures and rel.startswith("tests/fixtures/") and not rel.endswith(".py"):
+            continue
         if not rel.endswith(".py") or not rel.startswith("sqlglot/"):
             return None
         if info["is_new"] or info["is_deleted"] or info["is_binary"] or not info["hunks"]:

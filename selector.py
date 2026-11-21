@@ -920,7 +920,7 @@ def main():
             if VERIFY and tset and tset != maps.all and any(maps.ids[t] == MN_ID for t in tset):
                 try:
                     import cmpprune
-                    mfiles = cmpprune.code_patch_files(text, SRC)
+                    mfiles = cmpprune.code_patch_files(text, SRC, allow_fixtures=True)  # test_max_nodes reads no fixture
                 except Exception as e:
                     log("maxnodes-files error", cid, repr(e))
                     mfiles = None
