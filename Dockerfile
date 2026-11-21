@@ -1,22 +1,12 @@
-﻿FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    SKIP_INTEGRATION=0 \
-    PYTHONPATH=/sqlglot
-
-COPY requirements.lock /app/requirements.lock
-RUN pip install --no-cache-dir -r /app/requirements.lock
-
-RUN python -c "import urllib.request, tarfile, io, shutil; \
-url='https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz'; \
-data=urllib.request.urlopen(url).read(); \
-tf=tarfile.open(fileobj=io.BytesIO(data), mode='r:gz'); \
-tf.extractall('/tmp'); \
-shutil.move('/tmp/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa', '/sqlglot')"
-
-COPY coverage_map.json.gz /app/coverage_map.json.gz
+# Same base image the commits were labeled in.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+WORKDIR /app
 COPY selector.py /app/selector.py
-RUN chmod -R a+rX /app /sqlglot
-
-CMD ["python", "/app/selector.py"]
+COPY map /app/map
+# Python sources of sqlglot at the pinned commit (eb11aec), used to apply each
+# patch and syntax-check the result.
+COPY src.tar.gz /tmp/src.tar.gz
+RUN python -c "import tarfile; tarfile.open('/tmp/src.tar.gz').extractall('/app/src', filter='data')" \
+    && rm /tmp/src.tar.gz && chmod -R a+rX /app
+ENV BR_SRC=/app/src
+CMD ["python", "-S", "/app/selector.py"]
