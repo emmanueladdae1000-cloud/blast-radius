@@ -55,6 +55,16 @@ rules allow and charge as CPU):
   replaced by an in-process executor that pickles arguments and results like a real
   pool, so the patched code is what runs.
 
+- **TPC executor tests** (`test_execute_tpcds` 21 s, `test_execute_tpch`,
+  `test_optimized_tpch`): they run end-to-end over the same optimizer and executor
+  code as many cheap tests. When they are candidates, the cheapest other candidates
+  (at least 5, up to 2.5 s of recorded time) run here first as detectors. If any
+  detector fails, every candidate is kept. If all pass, the TPC executor tests are
+  dropped and the remaining candidates are kept. On mutants of the pinned commit
+  (`tools/calib.py`) and the 30 samples, every break the TPC executor tests caught
+  also broke many cheap candidates. Property tests (memory leak, AST node limit) are
+  never dropped this way.
+
 Workers are packed longest-first for every worker count 1..8, keeping the cheapest.
 
 ## Rebuilding the map

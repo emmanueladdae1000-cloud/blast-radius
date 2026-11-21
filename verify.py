@@ -120,7 +120,7 @@ class _Result(unittest.TestResult):
         super().addSubTest(test, subtest, err)
 
 
-def run(jobs, ids, src_root, budget_s, log):
+def run(jobs, ids, src_root, deadline, log):
     """jobs: list of (key, {rel: new_src}, [tidx in run order], timeout_s).
     Returns {key: (failed_tidx_list, unrun_tidx_list)} for jobs that completed."""
     t_start = time.time()
@@ -145,8 +145,9 @@ def run(jobs, ids, src_root, budget_s, log):
     results = {}
     tmpdir = "/tmp"
     for key, files, order, tmo in jobs:
-        if time.time() - t_start > budget_s:
-            log("verify: budget exhausted")
+        tmo = min(tmo, deadline - time.time())
+        if tmo < 3.0:
+            log("verify: deadline reached")
             break
         out = os.path.join(tmpdir, f"v_{os.getpid()}_{key}.json")
         pid = os.fork()
@@ -177,19 +178,9 @@ def run(jobs, ids, src_root, budget_s, log):
                 except BaseException:
                     pass
                 os._exit(code)
-        deadline = time.time() + tmo
-        status = None
-        while True:
-            r_pid, st = os.waitpid(pid, os.WNOHANG)
-            if r_pid:
-                status = st
-                break
-            if time.time() > deadline:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-                log("verify: timeout", key)
-                break
-            time.sleep(0.002)
+        status = _wait(pid, tmo)
+        if status is None:
+            log("verify: timeout", key)
         import resource
         ru = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu_now = ru.ru_utime + ru.ru_stime
@@ -299,7 +290,7 @@ def _run_tests(order, ids, mods_by_file):
     return failed, unrun
 
 
-def run_fresh(jobs, ids, src_root, budget_s, log):
+def run_fresh(jobs, ids, src_root, deadline, log):
     """Verification for edits outside function bodies: each job runs in a child that
     imports the patched modules from the patch text (class bodies and metaclasses run
     again), then the candidate tests. Returns {key: ("broken", None) | (failed, unrun)}."""
@@ -319,8 +310,9 @@ def run_fresh(jobs, ids, src_root, budget_s, log):
             pass
     import unittest.mock  # noqa: F401
     for key, files, order, tmo in jobs:
-        if time.time() - t_start > budget_s:
-            log("verify-fresh: budget exhausted")
+        tmo = min(tmo, deadline - time.time())
+        if tmo < 3.0:
+            log("verify-fresh: deadline reached")
             break
         out = os.path.join("/tmp", f"vf_{os.getpid()}_{key}.json")
         pid = os.fork()

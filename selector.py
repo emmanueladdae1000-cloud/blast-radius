@@ -622,6 +622,22 @@ V_MAX_TEST_MS = int(os.environ.get("BR_V_MAX_TEST_MS", "1500"))
 V_MAX_TESTS = int(os.environ.get("BR_V_MAX_TESTS", "120"))
 V_BUDGET_S = float(os.environ.get("BR_V_BUDGET_S", "90"))
 V_FRESH_MAX_MS = int(os.environ.get("BR_V_FRESH_MAX_MS", "1500"))
+# Verification stops at this many seconds after start, whatever the commit count
+# (practice allows 180 s for the batch, the final 270 s).
+V_DEADLINE_S = float(os.environ.get("BR_V_DEADLINE_S", "110"))
+HEAVY_SKIP = os.environ.get("BR_HEAVY_SKIP", "1") == "1"
+# End-to-end executor runs over TPC queries: they exercise the same optimizer and
+# executor code as many cheap tests, so a break they would catch also breaks cheap
+# candidates (measured on mutants of the pinned commit). Property tests such as the
+# memory-leak and AST-node-limit tests are never skipped.
+GAMBLE_TESTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+}
+HS_MAX_MS = int(os.environ.get("BR_HS_MAX_MS", "2500"))
+HS_MAX_TEST_MS = int(os.environ.get("BR_HS_MAX_TEST_MS", "2600"))
+HS_MIN_RUN = int(os.environ.get("BR_HS_MIN_RUN", "5"))
 
 
 def main():
@@ -646,6 +662,7 @@ def main():
     jobs = []
     fresh = []
     ichecks = []
+    special = {}   # key -> tests to keep when every cheap candidate passed (heavy skip)
     names = sorted(n for n in os.listdir(cdir) if n.endswith(".patch"))
     for name in names:
         cid = name[:-6]
@@ -663,12 +680,40 @@ def main():
                 tot = sum(ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6) for t in tl)
                 heavy = any("::".join(maps.ids[t].split("::")[:2]) in HEAVY_CLASSES or maps.ids[t] in NO_VERIFY for t in tl)
                 big = any(ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6) > V_MAX_TEST_MS for t in tl)
+                swap_ok = v["ok"] and v["src"] and not sel.importcheck
+                fresh_ok = v["fresh_ok"] and v["allsrc"]
+                msf = lambda t: ms_of.get(num_of.get(maps.ids[t], -1), 10 ** 6)
+                monsters = [t for t in tl if maps.ids[t] in GAMBLE_TESTS]
                 if not heavy and not big and tot <= V_MAX_MS:
-                    if v["ok"] and v["src"] and not sel.importcheck:
+                    if swap_ok:
                         jobs.append((len(results), v["src"], tl, 4.0 + 4.0 * tot / 1000.0))
-                    elif v["fresh_ok"] and v["allsrc"] and tot <= V_FRESH_MAX_MS:
+                    elif fresh_ok and tot <= V_FRESH_MAX_MS:
                         fresh.append((len(results), dict(v["allsrc"]), tl, 6.0 + 4.0 * tot / 1000.0))
                         fresh_job = True
+                elif HEAVY_SKIP and monsters and (swap_ok or fresh_ok):
+                    # Run every cheap candidate here. Any failure: keep the full set.
+                    # All pass: the monster tests are dropped (they cover the same code).
+                    # kill detectors: the cheapest candidates, up to HS_MAX_MS of recorded time
+                    run, runtot = [], 0
+                    exe = "tests/test_executor.py::TestExecutor"
+                    # cheapest first, non-executor tests before executor ones (whose class
+                    # setup loads the TPC data)
+                    for t in sorted(tl, key=lambda t: ("::".join(maps.ids[t].split("::")[:2]) == exe, msf(t), t)):
+                        if t in monsters or maps.ids[t] in NO_VERIFY or msf(t) > HS_MAX_TEST_MS:
+                            continue
+                        if runtot + msf(t) > HS_MAX_MS:
+                            break
+                        run.append(t)
+                        runtot += msf(t)
+                    ship = [t for t in tl if t not in monsters and t not in run]
+                    if len(run) >= HS_MIN_RUN and runtot <= HS_MAX_MS:
+                        keep_ship = {num_of[maps.ids[t]] for t in ship if maps.ids[t] in num_of}
+                        special[len(results)] = keep_ship
+                        if swap_ok:
+                            jobs.append((len(results), v["src"], run, 6.0 + 3.0 * runtot / 1000.0))
+                        else:
+                            fresh.append((len(results), dict(v["allsrc"]), run, 8.0 + 3.0 * runtot / 1000.0))
+                            fresh_job = True
             if sel.importcheck and not fresh_job:
                 ichecks.append((len(results), dict(sel.importcheck)))
         except Exception as e:  # never crash: run everything for this commit
@@ -691,7 +736,8 @@ def main():
     if fresh:
         try:
             import verify
-            done = verify.run_fresh(fresh, maps.ids, SRC, V_BUDGET_S / 2, log)
+            fresh.sort(key=lambda j: (j[0] not in special, j[0]))
+            done = verify.run_fresh(fresh, maps.ids, SRC, t0 + V_DEADLINE_S * 0.4, log)
             for key, files, _, _ in fresh:
                 res = done.get(key)
                 if res is None:
@@ -704,7 +750,13 @@ def main():
                     results[key][2] = results[key][2] + ["import-broken-all"]
                 else:
                     failed, unrun = res
-                    keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
+                    if key in special:
+                        if failed or unrun:
+                            results[key][2] = results[key][2] + ["heavy-kept"]
+                            continue
+                        keep = special[key]
+                    else:
+                        keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
                     results[key][2] = results[key][2] + [f"fresh-verified:{len(results[key][1])}->{len(keep)}"]
                     results[key][1] = keep
         except Exception as e:
@@ -714,9 +766,16 @@ def main():
     if jobs:
         try:
             import verify
-            done = verify.run(jobs, maps.ids, SRC, V_BUDGET_S, log)
+            jobs.sort(key=lambda j: (j[0] not in special, j[0]))
+            done = verify.run(jobs, maps.ids, SRC, t0 + V_DEADLINE_S, log)
             for key, (failed, unrun) in done.items():
-                keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
+                if key in special:
+                    if failed or unrun:
+                        results[key][2] = results[key][2] + ["heavy-kept"]
+                        continue
+                    keep = special[key]
+                else:
+                    keep = {num_of[maps.ids[t]] for t in failed + unrun if maps.ids[t] in num_of}
                 results[key][2] = results[key][2] + [f"verified:{len(results[key][1])}->{len(keep)}"]
                 results[key][1] = keep
         except Exception as e:
