@@ -701,6 +701,24 @@ def pack(items):
     return best[1]
 
 
+def commit_category(notes):
+    """Coarse kind of a commit, from the selector's own notes."""
+    text = " ".join(notes)
+    py = [n for n in notes if n.split(":")[0].endswith(".py") and not n.endswith(":comment")]
+    has_fix = any(("fixture" in n or "tpc-" in n) and not n.split(":")[0].endswith(".py") for n in notes)
+    if any(n.split(":")[0].startswith("tests/") and n.split(":")[0].endswith(".py") for n in py):
+        return "testfile"
+    if not py and has_fix:
+        return "fixture"
+    if not py and not has_fix:
+        return "comment"
+    if py and has_fix:
+        return "mixed"
+    if "import-time" in text or "class-hdr" in text or "f-imp" in text:
+        return "import"
+    return "code"
+
+
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 HEAVY_CLASSES = {"tests/test_executor.py::TestExecutor"}
 # tests that start a fresh interpreter (they would see the unpatched files)
@@ -884,6 +902,18 @@ def main():
                 results[key][1] = keep
         except Exception as e:
             log("verify error", repr(e))
+    # Ablation probe (practice board only): drop selections for one category of commit.
+    probe = os.environ.get("BR_ABLATE") or (open(os.path.join(HERE, "ABLATE")).read().strip()
+                                              if os.path.exists(os.path.join(HERE, "ABLATE")) else "")
+    if probe:
+        for r in results:
+            if commit_category(r[2]) == probe:
+                r[1] = set()
+    cats = {}
+    for r in results:
+        c = commit_category(r[2])
+        cats[c] = cats.get(c, 0) + 1
+    log("categories", cats)
     out_lines = []
     for cid, nums, notes in results:
         workers = pack([(n, ms_of[n]) for n in nums])
