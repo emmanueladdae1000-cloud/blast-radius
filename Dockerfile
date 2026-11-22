@@ -12,10 +12,11 @@ RUN python -c "import tarfile; tarfile.open('/tmp/src.tar.gz').extractall('/app/
     && rm /tmp/src.tar.gz \
     && python -m compileall -q /app/src \
     && chmod -R a+rX /app
-COPY selector.py verify.py cmpprune.py numeric_refinement.py expression_refinement.py default_refinement.py literal_execution_refinement.py test_costs.json operand_trace.json.gz default_bindings.json.gz import_lines.json.gz tpcds_lines.json.gz tpcds_expected.pkl.gz /app/
+COPY selector.py verify.py cmpprune.py numeric_refinement.py expression_refinement.py default_refinement.py literal_execution_refinement.py import_equivalence.py test_costs.json operand_trace.json.gz default_bindings.json.gz import_lines.json.gz tpcds_lines.json.gz tpcds_expected.pkl.gz /app/
 COPY map /app/map
 RUN python /app/numeric_refinement.py --build-audit /app/src \
-    && python -m compileall -q /app/verify.py /app/cmpprune.py /app/numeric_refinement.py /app/expression_refinement.py /app/default_refinement.py /app/literal_execution_refinement.py \
+    && python /app/import_equivalence.py --build-facts /app/src \
+    && python -m compileall -q /app/verify.py /app/cmpprune.py /app/numeric_refinement.py /app/expression_refinement.py /app/default_refinement.py /app/literal_execution_refinement.py /app/import_equivalence.py \
     && chmod -R a+rX /app
 ENV BR_SRC=/app/src
 CMD ["python", "/app/selector.py"]

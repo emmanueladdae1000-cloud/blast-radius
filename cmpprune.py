@@ -312,7 +312,7 @@ def _observed_compare(op, left, right, identical):
     return result
 
 
-def safe_tests(patch_text, src_root):
+def safe_tests(patch_text, src_root, *, _source=None):
     """Derive unchanged comparison behavior at runtime from raw baseline observations.
 
     The file contains no alternate-operator outcomes or edit-to-answer tables.
@@ -322,7 +322,12 @@ def safe_tests(patch_text, src_root):
     imports = _load('import_lines.json.gz')
     if not trace or trace.get('format') != 'raw-baseline-comparisons-v1' or imports is None:
         return set()
-    files = parse_unified_diff(patch_text)
+    if _source is None:
+        files = parse_unified_diff(patch_text)
+    else:
+        rel, original, patched = _source
+        files = {rel: {'is_new': False, 'is_deleted': False, 'is_binary': False,
+                       'old_path': rel, 'new_path': rel, 'hunks': [True]}}
     if not files:
         return set()
     safe = None
@@ -333,9 +338,10 @@ def safe_tests(patch_text, src_root):
                 info['old_path'] != info['new_path'] or not info['hunks']):
             return set()
         try:
-            with open(os.path.join(src_root, rel), encoding='utf8') as f:
-                original = f.read()
-            patched = apply_hunks(original, info['hunks'])
+            if _source is None:
+                with open(os.path.join(src_root, rel), encoding='utf8') as f:
+                    original = f.read()
+                patched = apply_hunks(original, info['hunks'])
             if patched is None:
                 return set()
             changes = compare_operand_changes(original, patched)
@@ -390,6 +396,14 @@ def safe_tests(patch_text, src_root):
             if not safe:
                 return set()
     return safe if changed and safe else set()
+
+
+def safe_source_tests(rel, original, patched, src_root):
+    """Comparison equivalence for one original source file and its patched text."""
+    if rel.startswith('sqlglot/typing/'):
+        # A metadata test can inspect annotator code without invoking it.
+        return set()
+    return safe_tests('', src_root, _source=(rel, original, patched))
 
 def tpcds_queries(patch_text, src_root):
     """For a patch that only edits sqlglot/*.py: (patched sources {rel: text}, sorted query indices of

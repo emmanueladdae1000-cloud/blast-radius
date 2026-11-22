@@ -1,5 +1,41 @@
 # Candidate validation
 
+## Current per-file composition and complete-context revision
+
+Latest official best remains166.8 seconds. The preceding candidate scored173.8
+(162.427 simulated, zero misses), receiptBB-58F1A6C0. This revision is pending
+official submission and does not claim the requested hidden below110 result.
+
+Public sample:110.195072,109.806517,109.796861 total seconds; rounded median
+109.8, zero misses in every run. Other local datasets, all zero misses:
+
+| Dataset | Simulated | CPU | Total |
+| --- | ---: | ---: | ---: |
+|4 full-suite-labeled default edits|4.275|7.767670|12.042670|
+|3 full-suite-labeled literal edits|4.050|10.422933|14.472933|
+|3 full-suite-labeled comparison edits|4.666|6.981991|11.647991|
+|12 earlier independent cases|34.470|2.894839|37.364839|
+|15-case evalA|97.716|13.059362|110.775362|
+
+The complete working-directory test suite passes97 tests, along with4476
+operand/operator checks and40 independent literal cases. New regressions prove
+that a fixture contribution survives source pruning and that a locally harmless
+source edit must still be applied when another edit activates its effect.
+
+Both replacement comparison profiles pass1620 tests,1skip and25440subtests:
+489.01 and492.64 seconds. All8773 reports attest contextversion2. Artifact:
+1561sites,142336site/testpairs,1618eligible tests,21970 restoredOptimizer rows;
+asynchronous214/1565 remain excluded. Full million-node and generator-memory
+methods were included. SHA256:
+08777494cf8f1f22458c64461fe90b544cde9c4d849b084befd9185863047d09.
+
+Container import identity has15 regressions, including poisoned class namespaces,
+replacement metaclasses, builtin shadowing and full-oracle dictionary/tuple
+rewrites. Facts are observed from original class-body frames in a fresh build
+process. Unsupported values, observers and namespace metadata remain conservative.
+
+The sections below preserve earlier revision measurements.
+
 Latest official score:166.8 seconds,158.849 simulated +7.93 seconds CPU,
 with zero missed commits (receipt BB-C91B3CE1, commit2fb4a1bf5db9).
 The comparison-execution revision scored167.3 officially with the identical

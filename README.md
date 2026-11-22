@@ -47,7 +47,7 @@ than relying on whichever commit is currently on the default branch.
 * Complete baseline observations include the real node-limit and generator-memory property tests. Unknown/overflow observations stay conservative. A shrunken proxy is not used to justify removing any property test.
 * Worker packing tries every count from 1 through 8 using longest-first balancing,
   minimizing the largest recorded worker load plus two seconds per worker.
-* For a patch changing only comparisons in one source file, exact compiled
+* For a source file changing only comparisons, exact compiled
   comparison positions identify the baseline execution lines that can observe
   the change. This avoids inheriting coverage from an entire multiline condition
   when short-circuit evaluation never reaches its changed comparison. Missing
@@ -55,7 +55,7 @@ than relying on whichever commit is currently on the default branch.
 * Verification children have independent CPU budgets. A terminated job retains
   every original candidate, including methods that passed before termination.
 * Exact scalar-literal changes can use the executed LOAD_CONST/RETURN_CONST
-  location, with the same import, introspection and single-file safeguards.
+  location, with the same import and introspection safeguards.
 * Boolean-default edits use raw baseline parameter bindings. A complete observed
   binding to the opposite exact Boolean proves that invocation supplied its own
   argument. Shared fixture observations constrain every affected test.
@@ -64,9 +64,22 @@ than relying on whichever commit is currently on the default branch.
 
 `default_bindings.json.gz` contains original bindings from two complete pinned
 pytest runs, including class/module fixture scope and reused worker attribution.
-It contains no alternate defaults or mutation outcomes. The historical comparison
-artifact currently excludes all TestOptimizer deductions because the older
-recorder did not reliably attribute shared process-pool input deserialization.
+It contains no alternate defaults or mutation outcomes. The comparison artifact
+also comes from two complete runs with shared fixture scope, opaque process-pool
+argument transport and worker-final serialization correctly attributed.
+
+Dependency proofs refine each file's contribution before unioning source, test,
+fixture and configuration candidates. If a test is outside that union, no file
+can introduce its first observable difference on the original execution. Actual
+runtime verification always applies every changed Python source, including a
+file whose own dependency contribution is empty. Fixture/configuration changes
+continue to disable source-only verification.
+
+Narrow import-time container identity wrappers can be proved unchanged using
+strict AST canonicalization. Class bodies require build-time observations that
+their actual namespace is an exact builtin dict. The facts builder observes
+class-body frames without invoking namespace methods or metaclasses. This
+separate import-identity proof currently requires a single-file patch.
 
 Dynamic baseline maps reflect observed executions. Nondeterminism or execution
 paths not represented in those observations can still affect unseen cases. Only

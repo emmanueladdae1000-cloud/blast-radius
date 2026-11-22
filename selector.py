@@ -474,6 +474,16 @@ class Selector:
             except SyntaxError:
                 return self.syntax_broken(rel, d), "syntax"
             self.vsrc = "".join(new)
+            if (getattr(self, 'allow_import_equivalence', False) and rel.startswith('sqlglot/')
+                    and any(re.search(r'\b(?:dict|tuple)\s*\(|\{\s*\*\*', text)
+                            for text in added_t + removed_t)):
+                try:
+                    import import_equivalence
+                    if import_equivalence.equivalent(rel, ''.join(orig), self.vsrc, src_root=SRC):
+                        self.vok = True
+                        return set(), 'import-value-identity'
+                except Exception as error:
+                    log('import identity fallback', rel, type(error).__name__)
             from verify import compiled_equivalent
             if compiled_equivalent(orig_path, "".join(orig), new_code):
                 self.vok = True
@@ -619,6 +629,16 @@ class Selector:
                     why.append(f'explicit-default-bindings:{before}->{len(out)}')
             except Exception as error:
                 log('default binding fallback', rel, type(error).__name__)
+        if comparison_possible and rel.startswith('sqlglot/') and self.vsrc is not None and out:
+            try:
+                import cmpprune
+                safe = cmpprune.safe_source_tests(rel, ''.join(orig), self.vsrc, SRC)
+                if safe:
+                    before = len(out)
+                    out = {test for test in out if self.m.ids[test] not in safe}
+                    why.append(f'operand-trace:{before}->{len(out)}')
+            except Exception as error:
+                log('source comparison fallback', rel, type(error).__name__)
         self.vok = vok
         return out, " ".join(sorted(set(why)))
 
@@ -788,11 +808,13 @@ class Selector:
         self.tpc_probe = None
         n_files = 0
         changes = parse_patch(text)
-        self.allow_numeric_refinement = len(changes) == 1
-        # Other changed files could make a previously skipped operand reachable.
-        self.allow_expression_refinement = len(changes) == 1
-        self.allow_default_refinement = len(changes) == 1
-        self.allow_literal_execution_refinement = len(changes) == 1
+        # Each file's first-effect proof refines only that file's contribution.
+        # The union retains a test affected by any other edited file.
+        self.allow_numeric_refinement = True
+        self.allow_expression_refinement = True
+        self.allow_default_refinement = True
+        self.allow_literal_execution_refinement = True
+        self.allow_import_equivalence = len(changes) == 1
         for ch in changes:
             n_files += 1
             old, new = ch["old"], ch["new"]
@@ -827,7 +849,9 @@ class Selector:
                 notes.append(f"{rel}:{why}")
                 if not self.vok:
                     self.verify["ok"] = False
-                elif self.vsrc is not None and t:
+                elif self.vsrc is not None:
+                    # A locally harmless edit can interact with another edit.
+                    # Actual verification must always execute the whole patch.
                     self.verify["src"][rel] = self.vsrc
                 if why != "comment":
                     if self.vsrc is None or not rel.startswith("sqlglot/") or why in ("syntax", "apply-failed"):
@@ -1122,19 +1146,6 @@ def main():
             nums = {num_of[maps.ids[t]] for t in tset if maps.ids[t] in num_of}
             if tset == maps.all:
                 nums |= set(unknown)
-            elif tset:
-                # Comparison-only changes: reason over raw edit-independent baseline observations.
-                try:
-                    import cmpprune
-                    safe_ids = cmpprune.safe_tests(text, SRC)
-                except Exception as e:
-                    log("cmpprune error", cid, repr(e))
-                    safe_ids = set()
-                if safe_ids:
-                    before = len(tset)
-                    tset = {t for t in tset if maps.ids[t] not in safe_ids}
-                    nums = {num_of[maps.ids[t]] for t in tset if maps.ids[t] in num_of}
-                    notes = notes + [f"operand-trace:{before}->{len(tset)}"]
             v = sel.verify
             fresh_job = False
             if VERIFY and tset and tset != maps.all:

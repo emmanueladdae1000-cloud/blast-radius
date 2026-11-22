@@ -36,10 +36,11 @@ for path in sorted(glob.glob(root+'/rawcmp_*.json.gz')):
     for context in data['incomplete_tests']:blocked[seed].update(expand(context))
     for site,ts in data['observations'].items():
         for context,row in ts.items():
+            pairs={json.dumps(p,separators=(',',':'),ensure_ascii=True) for p in row['pairs']}
             for tid in expand(context):
                 r=records[site][tid].setdefault(seed,{'complete':True,'pairs':set()})
                 r['complete'] &= row['complete']
-                r['pairs'].update(json.dumps(p,separators=(',',':'),ensure_ascii=True) for p in row['pairs'])
+                r['pairs'].update(pairs)
                 if len(r['pairs'])>128:r['complete']=False
 if len(seeds)<2: raise RuntimeError('Need at least two hash-seed runs')
 common=known_tests.intersection(*(passed[s]-blocked[s] for s in seeds))
