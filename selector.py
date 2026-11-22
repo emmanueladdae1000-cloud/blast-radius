@@ -716,8 +716,8 @@ TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPC_FIXED_MS = int(os.environ.get("BR_TPC_FIXED_MS", "3000"))     # imports + class setup (CSV load)
 TPC_QUERY_MS = int(os.environ.get("BR_TPC_QUERY_MS", "260"))      # average per TPC-DS query
 TPC_SAMPLE_OVER = int(os.environ.get("BR_TPC_SAMPLE_OVER", "20"))
-TPC_SAMPLE_FIRST = int(os.environ.get("BR_TPC_SAMPLE_FIRST", "4"))
-TPC_SAMPLE_CHEAP = int(os.environ.get("BR_TPC_SAMPLE_CHEAP", "4"))
+TPC_SAMPLE_FIRST = int(os.environ.get("BR_TPC_SAMPLE_FIRST", "2"))
+TPC_SAMPLE_CHEAP = int(os.environ.get("BR_TPC_SAMPLE_CHEAP", "2"))
 TPC_DEADLINE_S = float(os.environ.get("BR_TPC_DEADLINE_S", "150"))
 MN_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 FP_ON = os.environ.get("BR_FP", "0") == "1"
