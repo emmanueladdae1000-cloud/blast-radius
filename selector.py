@@ -671,7 +671,10 @@ class Selector:
                 notes.append("tests-data:" + why)
             else:
                 notes.append("ignored:" + rel)
-        if n_files == 1 and self.tpc_probe_candidate and len(self.tpc_probe_candidate[2]) <= TPC_PROBE_MAX:
+        # the probe runs the pinned sqlglot: fine when every other file in the commit is a comment-only
+        # Python edit or another fixture (test_execute_tpcds reads no other fixture)
+        code_edits = [n for n in notes if n.split(":")[0].endswith(".py") and not n.endswith(":comment")]
+        if not code_edits and self.tpc_probe_candidate and len(self.tpc_probe_candidate[2]) <= TPC_PROBE_MAX:
             self.tpc_probe = self.tpc_probe_candidate
         for n in notes:
             head = n.split(":")[0]
