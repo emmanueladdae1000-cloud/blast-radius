@@ -47,6 +47,13 @@ than relying on whichever commit is currently on the default branch.
 * Complete baseline observations include the real node-limit and generator-memory property tests. Unknown/overflow observations stay conservative. A shrunken proxy is not used to justify removing any property test.
 * Worker packing tries every count from 1 through 8 using longest-first balancing,
   minimizing the largest recorded worker load plus two seconds per worker.
+* For a patch changing only comparisons in one source file, exact compiled
+  comparison positions identify the baseline execution lines that can observe
+  the change. This avoids inheriting coverage from an entire multiline condition
+  when short-circuit evaluation never reaches its changed comparison. Missing
+  bytecode anchors, import execution and code-object observers fall back.
+* Verification children have independent CPU budgets. A terminated job retains
+  every original candidate, including methods that passed before termination.
 
 Dynamic baseline maps reflect observed executions. Nondeterminism or execution
 paths not represented in those observations can still affect unseen cases. Only

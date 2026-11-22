@@ -535,6 +535,16 @@ class Selector:
                     why.append('numeric-value-flow')
             except Exception as error:
                 log('numeric value-flow fallback', rel, type(error).__name__)
+        if (getattr(self, 'allow_expression_refinement', False)
+                and rel.startswith('sqlglot/') and self.vsrc is not None):
+            try:
+                import expression_refinement
+                reached = expression_refinement.affected_tests(rel, ''.join(orig), self.vsrc, self.m)
+                if reached is not None:
+                    out &= reached
+                    why.append('comparison-execution-span')
+            except Exception as error:
+                log('comparison execution fallback', rel, type(error).__name__)
         self.vok = vok
         return out, " ".join(sorted(set(why)))
 
@@ -705,6 +715,8 @@ class Selector:
         n_files = 0
         changes = parse_patch(text)
         self.allow_numeric_refinement = len(changes) == 1
+        # Other changed files could make a previously skipped operand reachable.
+        self.allow_expression_refinement = len(changes) == 1
         for ch in changes:
             n_files += 1
             old, new = ch["old"], ch["new"]
@@ -891,7 +903,7 @@ class VerificationCosts:
 
 
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPC_FIXED_MS = int(os.environ.get("BR_TPC_FIXED_MS", "3000"))     # imports + class setup (CSV load)
+TPC_FIXED_MS = int(os.environ.get("BR_TPC_FIXED_MS", "1400"))     # measured row preload + child import/setup
 TPC_QUERY_MS = int(os.environ.get("BR_TPC_QUERY_MS", "260"))      # average per TPC-DS query
 TPC_SAMPLE_OVER = int(os.environ.get("BR_TPC_SAMPLE_OVER", "20"))
 TPC_SAMPLE_FIRST = int(os.environ.get("BR_TPC_SAMPLE_FIRST", "8"))
@@ -904,6 +916,23 @@ MN_OTHER_MAX_TEST_MS = int(os.environ.get("BR_MN_OTHER_MAX_TEST_MS", "4000"))
 MN_SUB_MS = int(os.environ.get("BR_MN_SUB_MS", "3000"))
 MN_SUB_MIN = int(os.environ.get("BR_MN_SUB_MIN", "30"))
 MN_DEADLINE_S = float(os.environ.get("BR_MN_DEADLINE_S", "160"))
+
+
+def tpcds_probe_estimate(query_indices, baseline_ms):
+    """Measured full-query work, plus fixed setup and conservative query margin.
+
+    The complete99-query baseline probe cost17.440s CPU; these defaults estimate
+    19.370s before the caller's separate1.1 margin against packed savings.
+    """
+    query_indices = list(query_indices)
+    query_cpu = sum(baseline_ms[i] if 0 <= i < len(baseline_ms) else TPC_QUERY_MS
+                    for i in query_indices)
+    return TPC_FIXED_MS + (11 * query_cpu + 9) // 10 + 10 * len(query_indices)
+
+
+def verification_cpu_budget(estimate_ms, saving_ms):
+    """Bound an isolated verification's CPU by both its prediction and benefit."""
+    return min(5.0, (1.1 * estimate_ms + 50) / 1000.0, saving_ms / 1000.0)
 
 
 def commit_category(notes):
@@ -1042,11 +1071,12 @@ def main():
                     job_economics[len(results)] = (estimate, saving)
                     special[len(results)] = nums - {num_of[maps.ids[t]] for t in order}
                     timeout = max(4.0, 2.0 + 4.0 * estimate / 1000.0)
+                    cpu_budget = verification_cpu_budget(estimate, saving)
                     notes += [f"verify-plan:{len(order)}:{estimate}/{saving}ms"]
                     if swap_ok:
-                        jobs.append((len(results), v["src"], order, timeout))
+                        jobs.append((len(results), v["src"], order, timeout, cpu_budget))
                     else:
-                        fresh.append((len(results), dict(v["allsrc"]), order, timeout))
+                        fresh.append((len(results), dict(v["allsrc"]), order, timeout, cpu_budget))
                         fresh_job = True
             if VERIFY and sel.tpc_probe:
                 probes.append((len(results), sel.tpc_probe))
@@ -1078,7 +1108,7 @@ def main():
         if estimate <= remaining:
             selected.add(job[0])
             remaining -= estimate
-    for key, files, _, _ in fresh:
+    for key, files, _, _, _ in fresh:
         if key not in selected:
             ichecks.append((key, files))
     jobs = sorted((j for j in jobs if j[0] in selected), key=priority)
@@ -1111,7 +1141,7 @@ def main():
         try:
             import verify
             done = verify.run_fresh(fresh, maps.ids, SRC, t0 + V_DEADLINE_S * 0.4, log)
-            for key, files, _, _ in fresh:
+            for key, files, _, _, _ in fresh:
                 res = done.get(key)
                 if res is None:
                     # not verified: still make sure the patched modules import
@@ -1130,7 +1160,7 @@ def main():
                     results[key][1] = keep
         except Exception as e:
             log("verify-fresh error", repr(e))
-            for key, _, _, _ in fresh:
+            for key, _, _, _, _ in fresh:
                 results[key][1] = set(ms_of)
     if jobs:
         try:
@@ -1160,7 +1190,7 @@ def main():
                 base = (cmpprune._load("tpcds_lines.json.gz") or {}).get("ms") or []
                 bms = lambda i: base[i] if i < len(base) else 10 ** 6
                 qs, tag = q, 'full'
-                est = TPC_FIXED_MS + sum(int(1.3 * base[i]) + 40 if i < len(base) else TPC_QUERY_MS for i in qs)
+                est = tpcds_probe_estimate(qs, base)
                 if tnum in r[1]:
                     save = pack_cost(r[1], ms_of) - pack_cost(set(r[1]) - {tnum}, ms_of)
                     if est * 1.1 >= save:

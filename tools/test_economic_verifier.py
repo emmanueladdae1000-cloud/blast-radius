@@ -1,5 +1,6 @@
 """Small independent checks for safe economic verification; no challenge answers."""
 import difflib
+import gzip
 import json
 import os
 from pathlib import Path
@@ -89,6 +90,29 @@ class EconomicTests(unittest.TestCase):
         result.classes = setup or {}
         return result
 
+    def test_complete99_probe_estimate_has_margin_over_measured_cpu(self):
+        with gzip.open(ROOT / "tpcds_lines.json.gz", "rt") as source:
+            query_ms = json.load(source)["ms"]
+        self.assertEqual(len(query_ms), 99)
+        self.assertEqual(sum(query_ms), 15436)
+        with mock.patch.object(selector, "TPC_FIXED_MS", 1400):
+            estimate = selector.tpcds_probe_estimate(range(99), query_ms)
+        self.assertEqual(estimate, 19370)
+        self.assertGreater(estimate, 17440)  # measured total CPU, parent+child
+        marginal_alone = selector.pack_cost({55}, {55: 21454})
+        self.assertEqual(marginal_alone, 23454)
+        self.assertLess(1.1 * estimate, marginal_alone)
+
+    def test_unknown_query_timing_uses_conservative_fallback(self):
+        with mock.patch.object(selector, "TPC_FIXED_MS", 1400), \
+             mock.patch.object(selector, "TPC_QUERY_MS", 260):
+            self.assertEqual(selector.tpcds_probe_estimate([0, 1], [100]), 1816)
+
+    def test_verification_cpu_budget_never_exceeds_expected_benefit_or5s(self):
+        self.assertAlmostEqual(selector.verification_cpu_budget(186, 2028), 0.2546)
+        self.assertEqual(selector.verification_cpu_budget(4714, 6686), 5.0)
+        self.assertEqual(selector.verification_cpu_budget(2000, 2100), 2.1)
+
     def test_cost_only_packing_matches_emitted_worker_cost(self):
         rng = random.Random(421)
         for _ in range(100):
@@ -146,6 +170,52 @@ class EconomicTests(unittest.TestCase):
 
 
 class ExecutionTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "fork"), "requires Linux CPU timer")
+    def test_cpu_termination_discards_even_preceding_passed_methods(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "economic_busy.py")
+            old = "def answer():\n    return 1\n"
+            new = "def answer():\n    while True:\n        pass\n"
+            path.write_text(old)
+            module = types.ModuleType("economic_busy")
+            exec(compile(old, str(path), "exec"), module.__dict__)
+            marker = Path(directory, "first-method-completed")
+            class Example(unittest.TestCase):
+                def test_first(self):
+                    marker.write_text("passed")
+                def test_busy(self):
+                    module.answer()
+            tests = types.SimpleNamespace(Example=Example)
+            ids = ["economic_cpu_test.py::Example::test_first", "economic_cpu_test.py::Example::test_busy"]
+            jobs = [(88, {path.name: new}, [0, 1], 4.0, 0.03)]
+            before = time.monotonic()
+            with mock.patch.dict(sys.modules, {"economic_busy": module, "economic_cpu_test": tests}), \
+                 mock.patch.object(verify, "_setup"):
+                result = verify.run(jobs, ids, directory, time.time() + 5, lambda *args: None)
+            self.assertEqual(result, {})  # no partial passing prefix accepted
+            self.assertTrue(marker.exists())
+            self.assertLess(time.monotonic() - before, 2.0)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires Linux CPU timer")
+    def test_fresh_cpu_termination_discards_all_partial_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "fresh-first-completed")
+            class Example(unittest.TestCase):
+                def test_first(self):
+                    marker.write_text("passed")
+                def test_busy(self):
+                    while True:
+                        pass
+            tests = types.SimpleNamespace(Example=Example)
+            ids = ["economic_fresh_cpu_test.py::Example::test_first", "economic_fresh_cpu_test.py::Example::test_busy"]
+            jobs = [(89, {}, [0, 1], 4.0, 0.03)]
+            with mock.patch.dict(sys.modules, {"economic_fresh_cpu_test": tests}), \
+                 mock.patch.object(verify, "_setup"), mock.patch.object(verify, "_install_finder", return_value={}), \
+                 mock.patch.object(verify, "_import_patched"):
+                result = verify.run_fresh(jobs, ids, directory, time.time() + 5, lambda *args: None)
+            self.assertEqual(result, {})
+            self.assertTrue(marker.exists())
+
     def test_failure_skip_and_every_unrun_test_are_retained(self):
         class Example(unittest.TestCase):
             def test_pass(self):
@@ -194,14 +264,18 @@ class ExecutionTests(unittest.TestCase):
                 planned_in.append(os.getpid())
                 return original_plan(*args)
             verify._old_code_tree.cache_clear()
+            messages = []
             with mock.patch.dict(sys.modules, {"economic_fake": module, "economic_test": tests}), \
-                 mock.patch.object(verify, "_setup"), mock.patch.object(verify, "_plan_swaps", side_effect=plan):
+                 mock.patch.object(verify, "_setup"), mock.patch.object(verify, "_plan_swaps", side_effect=plan), \
+                 mock.patch.object(verify, "_children_cpu", side_effect=[100.0, 100.015, 100.025]):
                 result = verify.run(jobs, ["economic_test.py::Example::test_original_answer"], directory,
-                                    time.time() + 10, lambda *args: None)
+                                    time.time() + 10, lambda *args: messages.append(" ".join(map(str, args))))
             self.assertEqual(result, {0: ([0], []), 1: ([0], [])})
             self.assertEqual(planned_in, [os.getpid(), os.getpid()])
             self.assertEqual(verify._old_code_tree.cache_info().misses, 1)
             self.assertEqual(module.answer(), 1)  # fork swaps did not leak to parent
+            self.assertIn("verify: job 0 cpu 0.015", messages)
+            self.assertIn("verify: job 1 cpu 0.010", messages)
 
 
 if __name__ == "__main__":

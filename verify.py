@@ -178,13 +178,34 @@ class _Result(unittest.TestResult):
         super().addSubTest(test, subtest, err)
 
 
+def _verification_job(job):
+    """Accept legacy four-field jobs and optional independent CPU budgets."""
+    key, files, order, timeout = job[:4]
+    cpu_budget = job[4] if len(job) > 4 else min(5.0, timeout)
+    return key, files, order, timeout, cpu_budget
+
+
+def _arm_cpu_budget(seconds):
+    # Default termination cannot be swallowed by unittest's exception handlers.
+    # A terminated child never contributes a successful verification result.
+    signal.signal(signal.SIGPROF, signal.SIG_DFL)
+    signal.setitimer(signal.ITIMER_PROF, max(0.001, seconds))
+
+
+def _children_cpu():
+    import resource
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
+
+
 def run(jobs, ids, src_root, deadline, log):
-    """jobs: list of (key, {rel: new_src}, [tidx in run order], timeout_s).
+    """jobs: (key, {rel: new_src}, [tidx], wall_timeout_s[, cpu_budget_s]).
     Returns {key: (failed_tidx_list, unrun_tidx_list)} for jobs that completed."""
+    jobs = [_verification_job(job) for job in jobs]
     # Compilation belongs in the shared parent: child-local caches disappear at
     # exit and would recompile the same large baseline module for every patch.
     planned = {}
-    for key, files, _, _ in jobs:
+    for key, files, _, _, _ in jobs:
         try:
             plans = []
             for rel, new_src in files.items():
@@ -205,24 +226,25 @@ def run(jobs, ids, src_root, deadline, log):
     import importlib
 
     mods = {}
-    need = sorted({ids[t].split("::")[0] for _, _, ts, _ in jobs for t in ts})
+    need = sorted({ids[t].split("::")[0] for _, _, ts, _, _ in jobs for t in ts})
     for f in need:
         name = f[:-3].replace("/", ".")
         try:
             mods[f] = importlib.import_module(name)
         except BaseException as e:
             log("verify: import failed", name, repr(e)[:200])
-    for _, files, _, _ in jobs:
+    for _, files, _, _, _ in jobs:
         for rel in files:
             importlib.import_module(rel[:-3].replace("/", "."))
     gc.collect()
-    function_index = _function_index({os.path.join(src_root, rel) for _, files, _, _ in jobs for rel in files})
+    function_index = _function_index({os.path.join(src_root, rel) for _, files, _, _, _ in jobs for rel in files})
     import resource
     ru = resource.getrusage(resource.RUSAGE_SELF)
     log("verify: parent setup cpu %.3f" % (ru.ru_utime + ru.ru_stime))
     results = {}
     tmpdir = "/tmp"
-    for key, files, order, tmo in jobs:
+    previous_cpu = _children_cpu()
+    for key, files, order, tmo, cpu_budget in jobs:
         tmo = min(tmo, deadline - time.time())
         if tmo < 3.0:
             log("verify: deadline reached")
@@ -232,6 +254,7 @@ def run(jobs, ids, src_root, deadline, log):
         if pid == 0:
             code = 1
             try:
+                _arm_cpu_budget(cpu_budget)
                 ok = True
                 for path, swaps in planned[key]:
                     if not _apply(path, swaps, function_index):
@@ -255,11 +278,9 @@ def run(jobs, ids, src_root, deadline, log):
         status = _wait(pid, tmo)
         if status is None:
             log("verify: timeout", key)
-        import resource
-        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
-        cpu_now = ru.ru_utime + ru.ru_stime
-        log("verify: job %s cpu %.3f" % (key, cpu_now - getattr(run, "_last", 0.0)))
-        run._last = cpu_now
+        cpu_now = _children_cpu()
+        log("verify: job %s cpu %.3f" % (key, cpu_now - previous_cpu))
+        previous_cpu = cpu_now
         if status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 and os.path.exists(out):
             with open(out) as fh:
                 d = json.load(fh)
@@ -373,11 +394,12 @@ def run_fresh(jobs, ids, src_root, deadline, log):
     imports the patched modules from the patch text (class bodies and metaclasses run
     again), then the candidate tests. Returns {key: ("broken", None) | (failed, unrun)}."""
     import importlib
+    jobs = [_verification_job(job) for job in jobs]
     t_start = time.time()
     results = {}
     # third-party libraries the test modules need do not depend on sqlglot: import
     # them once here so every forked child shares them.
-    need = {ids[t].split("::")[0] for _, _, order, _ in jobs for t in order}
+    need = {ids[t].split("::")[0] for _, _, order, _, _ in jobs for t in order}
     if need & {"tests/test_optimizer.py", "tests/test_executor.py", "tests/test_schema.py"}:
         try:
             import duckdb  # noqa: F401
@@ -387,7 +409,8 @@ def run_fresh(jobs, ids, src_root, deadline, log):
         except BaseException:
             pass
     import unittest.mock  # noqa: F401
-    for key, files, order, tmo in jobs:
+    previous_cpu = _children_cpu()
+    for key, files, order, tmo, cpu_budget in jobs:
         tmo = min(tmo, deadline - time.time())
         if tmo < 3.0:
             log("verify-fresh: deadline reached")
@@ -397,6 +420,7 @@ def run_fresh(jobs, ids, src_root, deadline, log):
         if pid == 0:
             code = 1
             try:
+                _arm_cpu_budget(cpu_budget)
                 _setup(src_root)
                 mods = _install_finder(src_root, files)
                 try:
@@ -421,11 +445,9 @@ def run_fresh(jobs, ids, src_root, deadline, log):
             finally:
                 os._exit(code)
         st = _wait(pid, tmo)
-        import resource
-        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
-        cpu_now = ru.ru_utime + ru.ru_stime
-        log("verify-fresh: job %s cpu %.3f" % (key, cpu_now - getattr(run_fresh, "_last", 0.0)))
-        run_fresh._last = cpu_now
+        cpu_now = _children_cpu()
+        log("verify-fresh: job %s cpu %.3f" % (key, cpu_now - previous_cpu))
+        previous_cpu = cpu_now
         if st is not None and os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 and os.path.exists(out):
             with open(out) as fh:
                 d = json.load(fh)

@@ -1,7 +1,29 @@
 # Candidate validation
 
-Official score before this revision:168.9 seconds,158.846 simulated + about10 seconds CPU,
-with zero missed commits. The revised official score is pending submission.
+Latest official score:166.8 seconds,158.849 simulated +7.93 seconds CPU,
+with zero missed commits (receipt BB-C91B3CE1, commit2fb4a1bf5db9).
+The comparison-execution revision below is pending official submission.
+
+## Comparison-execution revision
+
+The public sample scored108.607113,108.717232 and108.752462 seconds;
+rounded median108.7, zero misses in all three runs under the same limits.
+Twelve independent full-suite-labeled cases scored57.974815 total, zero misses.
+Existing15-case evalA scored118.205680 total, zero misses.
+Three additional comparison changes were each labeled by the complete pinned
+pytest suite (90.605,79.995 and83.167 seconds for the oracle runs). Their actual
+failing tests were[497,597],[],[773]. The revised entry selected every failing
+test:4.666 simulated +5.387356 CPU =10.053356 total. The previous official entry
+on the identical three cases scored110.168 simulated +4.139980 CPU =114.307980,
+also zero misses. These aggregate totals are not leaderboard scores.
+
+Nineteen expression dependency regressions and17 economic verifier tests pass,
+including actual VM comparison locations, short-circuit reachability, import and
+code-object observation fallbacks, multiple edits, missing metadata and real
+CPU termination that discards all partial results. The refinement is disabled
+for patches spanning multiple files. Per-test baseline CPU facts now include
+ten additional complete methods. All30 public-sample worker schedules were
+checked against lower bounds or exhaustive small-set partitioning and are optimal.
 
 ## Public sample, exact competition runtime limits
 
