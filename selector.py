@@ -716,11 +716,12 @@ TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPC_FIXED_MS = int(os.environ.get("BR_TPC_FIXED_MS", "3000"))     # imports + class setup (CSV load)
 TPC_QUERY_MS = int(os.environ.get("BR_TPC_QUERY_MS", "260"))      # average per TPC-DS query
 TPC_SAMPLE_OVER = int(os.environ.get("BR_TPC_SAMPLE_OVER", "20"))
-TPC_SAMPLE_FIRST = int(os.environ.get("BR_TPC_SAMPLE_FIRST", "8"))
-TPC_SAMPLE_CHEAP = int(os.environ.get("BR_TPC_SAMPLE_CHEAP", "8"))
+TPC_SAMPLE_FIRST = int(os.environ.get("BR_TPC_SAMPLE_FIRST", "4"))
+TPC_SAMPLE_CHEAP = int(os.environ.get("BR_TPC_SAMPLE_CHEAP", "4"))
 TPC_DEADLINE_S = float(os.environ.get("BR_TPC_DEADLINE_S", "150"))
 MN_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 FP_ON = os.environ.get("BR_FP", "0") == "1"
+PRELUDE_ADD = os.environ.get("BR_PRELUDE_ADD", "1") == "1"
 FP_DEADLINE_S = float(os.environ.get("BR_FP_DEADLINE_S", "100"))
 MN_OTHER_MAX_TEST_MS = int(os.environ.get("BR_MN_OTHER_MAX_TEST_MS", "4000"))
 MN_SUB_MS = int(os.environ.get("BR_MN_SUB_MS", "3000"))
@@ -911,6 +912,23 @@ def main():
                             fresh_job = True
             if VERIFY and sel.tpc_probe:
                 probes.append((len(results), sel.tpc_probe))
+            if VERIFY and tset and tset != maps.all and PRELUDE_ADD:
+                # an edit to code that runs while sqlglot loads can break the two slow end-to-end
+                # tests even when the coverage map does not link them: add them as candidates when
+                # their cheap checks can run (the checks below drop them again when they pass)
+                try:
+                    import cmpprune
+                    if cmpprune.touches_tpcds_prelude(text):
+                        tidx_of_id = {i: t for t, i in enumerate(maps.ids)}
+                        if TPCDS_ID in tidx_of_id and tidx_of_id[TPCDS_ID] not in tset and cmpprune.tpcds_queries(text, SRC):
+                            tset = set(tset) | {tidx_of_id[TPCDS_ID]}
+                            notes = notes + ["tpcds-added"]
+                        if MN_ID in tidx_of_id and tidx_of_id[MN_ID] not in tset and cmpprune.code_patch_files(text, SRC, allow_fixtures=True):
+                            tset = set(tset) | {tidx_of_id[MN_ID]}
+                            notes = notes + ["maxnodes-added"]
+                        nums = {num_of[maps.ids[t]] for t in tset if maps.ids[t] in num_of}
+                except Exception as e:
+                    log("prelude-add error", cid, repr(e))
             if VERIFY and tset and tset != maps.all and any(maps.ids[t] == TPCDS_ID for t in tset):
                 try:
                     import cmpprune

@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _CMP_OPS = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
             ast.Is: "is", ast.IsNot: "is not"}
 _cache = {}
+PRELUDE_AS_ALL = os.environ.get("BR_TPC_PRELUDE", "1") == "1"
 
 
 def _load(name):
@@ -282,7 +283,11 @@ def tpcds_queries(patch_text, src_root):
         qm = tl["q"].get(rel, {})
         for ln in info["old_lines"]:
             if ln in pre:
-                return None
+                # runs while modules load / the class sets up: its effect can reach every query.
+                # The probe imports the patched sources fresh, so treat it as reaching them all.
+                q.update(range(len(tl.get("ms") or [])) if PRELUDE_AS_ALL else ())
+                if not PRELUDE_AS_ALL:
+                    return None
             q.update(qm.get(str(ln), ()))
     if not out_files:
         return None
@@ -321,3 +326,19 @@ def code_patch_files(patch_text, src_root, allow_fixtures=False):
             return None
         out[rel] = new_src
     return out or None
+
+
+def touches_tpcds_prelude(patch_text):
+    """True when a changed line of an existing sqlglot/*.py file runs while sqlglot and the executor
+    tests load (class bodies, import-time code): such an edit can reach code paths the per-test
+    coverage map does not attribute to any single test."""
+    tl = _load("tpcds_lines.json.gz")
+    if not tl:
+        return False
+    files = parse_unified_diff(patch_text)
+    for rel, info in files.items():
+        if rel.endswith(".py") and rel.startswith("sqlglot/"):
+            pre = set(tl["prelude"].get(rel, ()))
+            if info["old_lines"] & pre:
+                return True
+    return False

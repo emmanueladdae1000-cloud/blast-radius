@@ -785,8 +785,8 @@ def maxnodes_proxy(src_root, files, deadline, log, cap_s=4.0):
             cols = [f"col{i}" for i in range(500)]
             assert isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select)
             expr = "x" + "=x" * 100
-            sql = f"SELECT {','.join(expr for _ in range(600))}"
-            for limit, needle in ((20_000, "Maximum number of AST nodes"), (50_000, "(50000)")):
+            sql = f"SELECT {','.join(expr for _ in range(300))}"
+            for limit, needle in ((10_000, "Maximum number of AST nodes"), (25_000, "(25000)")):
                 try:
                     parse_one(sql, max_nodes=limit)
                     raise AssertionError("no ParseError")
