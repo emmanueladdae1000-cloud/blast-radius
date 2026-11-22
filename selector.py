@@ -11,6 +11,56 @@ import re
 import sys
 import time
 
+
+def possible_expression_edits(removed, added):
+    """Cheap eligibility filter; full-source proof still decides every refinement."""
+    import io
+    import token
+    import tokenize
+
+    def tokens(lines):
+        result = []
+        try:
+            for item in tokenize.generate_tokens(io.StringIO('\n'.join(lines)).readline):
+                if item.type in (token.NEWLINE, tokenize.NL, token.INDENT, token.DEDENT,
+                                 token.ENDMARKER, token.COMMENT, token.ENCODING):
+                    continue
+                if item.type == token.ERRORTOKEN:
+                    if item.string.isspace():
+                        continue
+                    return None
+                literal = item.type in (token.NUMBER, token.STRING) or (
+                    item.type == token.NAME and item.string in ('True', 'False', 'None'))
+                result.append(('<literal>' if literal else item.string, literal))
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            # Diff fragments need not be complete Python statements.
+            return None
+        return result
+
+    before, after = tokens(removed), tokens(added)
+    if before is None or after is None:
+        return True, True
+
+    def comparison_key(items):
+        result = []
+        index = 0
+        while index < len(items):
+            value = items[index][0]
+            if value == 'is':
+                if index + 1 < len(items) and items[index + 1][0] == 'not':
+                    index += 1
+                value = '<compare>'
+            elif value in ('==', '!=', '<', '<=', '>', '>='):
+                value = '<compare>'
+            result.append(value)
+            index += 1
+        return result
+
+    literal = (any(value[1] for value in before + after)
+               and [value[0] for value in before] == [value[0] for value in after])
+    comparison = comparison_key(before) == comparison_key(after)
+    return literal, comparison
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAP = os.path.join(HERE, "map")
 DATA = os.environ.get("BR_DATA", "/data")
@@ -535,7 +585,8 @@ class Selector:
                     why.append('numeric-value-flow')
             except Exception as error:
                 log('numeric value-flow fallback', rel, type(error).__name__)
-        if (getattr(self, 'allow_expression_refinement', False)
+        literal_possible, comparison_possible = possible_expression_edits(removed_t, added_t)
+        if (getattr(self, 'allow_expression_refinement', False) and comparison_possible
                 and rel.startswith('sqlglot/') and self.vsrc is not None):
             try:
                 import expression_refinement
@@ -545,6 +596,29 @@ class Selector:
                     why.append('comparison-execution-span')
             except Exception as error:
                 log('comparison execution fallback', rel, type(error).__name__)
+        if (getattr(self, 'allow_literal_execution_refinement', False) and literal_possible
+                and out and rel.startswith('sqlglot/') and self.vsrc is not None):
+            try:
+                import literal_execution_refinement
+                reached = literal_execution_refinement.affected_tests(rel, ''.join(orig), self.vsrc, self.m)
+                if reached is not None:
+                    out &= reached
+                    why.append('literal-execution-span')
+            except Exception as error:
+                log('literal execution fallback', rel, type(error).__name__)
+        if (getattr(self, 'allow_default_refinement', False) and literal_possible
+                and rel.startswith('sqlglot/') and self.vsrc is not None
+                and any(re.search(r'\b(?:True|False)\b', text) for text in removed_t)
+                and any(re.search(r'\b(?:True|False)\b', text) for text in added_t)):
+            try:
+                import default_refinement
+                safe = default_refinement.safe_tests(rel, ''.join(orig), self.vsrc)
+                if safe:
+                    before = len(out)
+                    out = {test for test in out if self.m.ids[test] not in safe}
+                    why.append(f'explicit-default-bindings:{before}->{len(out)}')
+            except Exception as error:
+                log('default binding fallback', rel, type(error).__name__)
         self.vok = vok
         return out, " ".join(sorted(set(why)))
 
@@ -717,6 +791,8 @@ class Selector:
         self.allow_numeric_refinement = len(changes) == 1
         # Other changed files could make a previously skipped operand reachable.
         self.allow_expression_refinement = len(changes) == 1
+        self.allow_default_refinement = len(changes) == 1
+        self.allow_literal_execution_refinement = len(changes) == 1
         for ch in changes:
             n_files += 1
             old, new = ch["old"], ch["new"]

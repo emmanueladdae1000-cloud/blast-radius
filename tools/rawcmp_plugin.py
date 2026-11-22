@@ -1,6 +1,6 @@
 """Observe original baseline comparison operands; never execute an alternate operator."""
 import ast, builtins, concurrent.futures as cf, functools, gzip, importlib.abc, importlib.machinery
-import inspect, json, operator, os, sys
+import inspect, json, operator, os, pickle, sys
 import pytest
 ROOT = os.path.realpath(os.environ.get('BR_PROFILE_SRC', '/app/src'))
 OUT = os.environ.get('BR_PROFILE_OUT', '/out')
@@ -10,6 +10,7 @@ NODES, OBS = {}, {}
 FAILED, PASSED, INCOMPLETE = set(), set(), set()
 COLLECTION_FAILED = []
 TASK_N = 0
+WORKER_FINALIZER = None
 OPS = {ast.Eq:'==', ast.NotEq:'!=', ast.Lt:'<', ast.LtE:'<=', ast.Gt:'>', ast.GtE:'>=', ast.Is:'is', ast.IsNot:'is not'}
 ORIGINAL = {'==':operator.eq, '!=':operator.ne, '<':operator.lt, '<=':operator.le, '>':operator.gt, '>=':operator.ge, 'is':operator.is_, 'is not':operator.is_not}
 RICH_NAMES=frozenset(('__eq__','__ne__','__lt__','__le__','__gt__','__ge__'))
@@ -17,7 +18,8 @@ with open(os.environ.get('BR_TESTS_JSON', '/data/tests.json')) as f:
     ID2NUM = {t['id']:t['number'] for t in json.load(f)['tests']}
 
 def test_key(nodeid):
-    return str(ID2NUM.get(nodeid.split('[',1)[0], 'unknown:'+nodeid))
+    number=ID2NUM.get(nodeid.split('[',1)[0])
+    return str(number) if number is not None else '@import'
 
 def static_method(t,name):
     # Read class dictionaries directly without descriptors or custom metaclass lookup.
@@ -154,24 +156,35 @@ sys.meta_path.insert(0,Finder())
 
 def dump(tag):
     rows={site:{tid:{'complete':r['complete'],'pairs':sorted(r['pairs'],key=repr)} for tid,r in ts.items()} for site,ts in OBS.items()}
-    data={'format':'raw-baseline-comparisons-v1','seed':os.environ.get('SEEDTAG','s'),'nodes':{s:NODES[s] for s in rows},'observations':rows,'failed_tests':sorted(FAILED),'passed_tests':sorted(PASSED),'incomplete_tests':sorted(x for x in INCOMPLETE if x is not None),'collection_failures':COLLECTION_FAILED}
+    data={'format':'raw-baseline-comparisons-v1','context_version':2,'seed':os.environ.get('SEEDTAG','s'),'nodes':{s:NODES[s] for s in rows},'observations':rows,'failed_tests':sorted(FAILED),'passed_tests':sorted(PASSED),'incomplete_tests':sorted(x for x in INCOMPLETE if x is not None),'collection_failures':COLLECTION_FAILED}
     os.makedirs(OUT,exist_ok=True)
     name='rawcmp_%s_%s_%s_%s.json.gz'%(data['seed'],os.environ.get('PYTEST_XDIST_WORKER','main'),os.getpid(),tag)
     with gzip.open(os.path.join(OUT,name),'wt',encoding='utf8') as f: json.dump(data,f,separators=(',',':'),allow_nan=False)
 
-def profile_task(tid,fn,args,kwargs):
-    global OBS,TASK_N
+def profile_task(tid,payload):
+    global OBS,TASK_N,WORKER_FINALIZER
+    if WORKER_FINALIZER is None:
+        from multiprocessing.util import Finalize
+        WORKER_FINALIZER=Finalize(None,dump,args=('workerfinal',),exitpriority=0)
     dump('initializer'+str(TASK_N+1))
     OBS={}
     ACTIVE[0]=tid
+    os.environ['BR_PROFILE_ACTIVE']=tid
     TASK_N+=1
-    try: return fn(*args,**kwargs)
+    try:
+        fn,args,kwargs=pickle.loads(payload)
+        return fn(*args,**kwargs)
     finally: dump('task'+str(TASK_N))
 
 _process_submit=cf.ProcessPoolExecutor.submit
 def process_submit(self,fn,/,*args,**kwargs):
     if ACTIVE[0] is None: return _process_submit(self,fn,*args,**kwargs)
-    return _process_submit(self,profile_task,ACTIVE[0],fn,args,kwargs)
+    from multiprocessing.reduction import ForkingPickler
+    try: payload=bytes(ForkingPickler.dumps((fn,args,kwargs)))
+    except Exception:
+        INCOMPLETE.add(ACTIVE[0])
+        return _process_submit(self,fn,*args,**kwargs)
+    return _process_submit(self,profile_task,ACTIVE[0],payload)
 cf.ProcessPoolExecutor.submit=process_submit
 _thread_submit=cf.ThreadPoolExecutor.submit
 def thread_submit(self,*args,**kwargs):
@@ -187,15 +200,38 @@ def _watch_popen(self,*args,**kwargs):
 subprocess.Popen.__init__=_watch_popen
 @pytest.hookimpl(hookwrapper=True,tryfirst=True)
 def pytest_runtest_protocol(item,nextitem):
-    old=ACTIVE[0]
-    ACTIVE[0]=test_key(item.nodeid)
-    old_env=os.environ.get('BR_PROFILE_ACTIVE')
-    os.environ['BR_PROFILE_ACTIVE']=ACTIVE[0]
+    old=_set_context(test_key(item.nodeid))
     try: yield
-    finally:
-        ACTIVE[0]=old
-        if old_env is None: os.environ.pop('BR_PROFILE_ACTIVE',None)
-        else: os.environ['BR_PROFILE_ACTIVE']=old_env
+    finally:_restore_context(old)
+
+def _set_context(context):
+    old=ACTIVE[0],os.environ.get('BR_PROFILE_ACTIVE')
+    ACTIVE[0]=context
+    if context is None:os.environ.pop('BR_PROFILE_ACTIVE',None)
+    else:os.environ['BR_PROFILE_ACTIVE']=context
+    return old
+
+def _restore_context(old):
+    ACTIVE[0]=old[0]
+    if old[1] is None:os.environ.pop('BR_PROFILE_ACTIVE',None)
+    else:os.environ['BR_PROFILE_ACTIVE']=old[1]
+
+@pytest.hookimpl(hookwrapper=True,tryfirst=True)
+def pytest_fixture_setup(fixturedef,request):
+    if fixturedef.scope=='function':
+        yield
+        return
+    prefix=request.node.nodeid.split('[',1)[0]
+    matched=any(not prefix or tid==prefix or tid.startswith(prefix+'::') or tid.startswith(prefix+'/') for tid in ID2NUM)
+    old=_set_context('@scope:'+prefix if matched else '@import')
+    try:yield
+    finally:_restore_context(old)
+
+@pytest.hookimpl(hookwrapper=True,tryfirst=True)
+def pytest_runtest_teardown(item,nextitem):
+    old=_set_context('@import')
+    try:yield
+    finally:_restore_context(old)
 
 def pytest_runtest_logreport(report):
     if report.failed: FAILED.add(test_key(report.nodeid))

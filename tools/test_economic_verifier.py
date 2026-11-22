@@ -210,11 +210,65 @@ class ExecutionTests(unittest.TestCase):
             ids = ["economic_fresh_cpu_test.py::Example::test_first", "economic_fresh_cpu_test.py::Example::test_busy"]
             jobs = [(89, {}, [0, 1], 4.0, 0.03)]
             with mock.patch.dict(sys.modules, {"economic_fresh_cpu_test": tests}), \
+                 mock.patch.dict(os.environ, {"BR_FRESH_EXEC": "0"}), \
                  mock.patch.object(verify, "_setup"), mock.patch.object(verify, "_install_finder", return_value={}), \
                  mock.patch.object(verify, "_import_patched"):
                 result = verify.run_fresh(jobs, ids, directory, time.time() + 5, lambda *args: None)
             self.assertEqual(result, {})
             self.assertTrue(marker.exists())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires Linux exec worker")
+    def test_clean_exec_full_methods_patches_skips_unknown_and_cpu_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for package in ("sqlglot", "tests"):
+                (root / package).mkdir()
+                (root / package / "__init__.py").write_text("")
+            (root / "sqlglot" / "example.py").write_text("VALUE = 1\n")
+            marker = root / "exec-first-completed"
+            (root / "tests" / "test_exec.py").write_text(
+                "import os,sys,unittest\nimport sqlglot.example as example\n"
+                "class Example(unittest.TestCase):\n"
+                "    def test_pass(self):\n"
+                "        self.assertEqual(example.VALUE, 2)\n"
+                "        self.assertNotIn('economic_parent_only', sys.modules)\n"
+                "        os.write(1, b'worker output redirected to stderr\\n')\n"
+                "    def test_fail(self):\n"
+                "        self.assertEqual(example.VALUE, 1)\n"
+                "    @unittest.skip('retained')\n"
+                "    def test_skip(self): pass\n"
+                "    def test_first(self):\n"
+                f"        open({str(marker)!r}, 'w').write('passed')\n"
+                "    def test_busy(self):\n"
+                "        while True: pass\n"
+            )
+            names = ["test_pass", "test_fail", "test_skip", "test_first", "test_busy", "test_missing"]
+            ids = ["tests/test_exec.py::Example::" + name for name in names]
+            patched = {"sqlglot/example.py": "VALUE = 2\n"}
+            jobs = [(90, patched, [0], 4), (91, patched, [1, 0], 4, 1.0),
+                    (92, patched, [2, 0], 4, 1.0), (93, patched, [3, 4], 4, 0.3),
+                    (94, patched, [5], 4, 1.0),
+                    (95, {"sqlglot/example.py": "raise RuntimeError('broken')\n"}, [0], 4, 1.0)]
+            read_fd, write_fd = os.pipe()
+            saved_stdout = os.dup(1)
+            try:
+                os.dup2(write_fd, 1)
+                os.close(write_fd)
+                with mock.patch.dict(sys.modules, {"economic_parent_only": types.ModuleType("economic_parent_only")}), \
+                     mock.patch.dict(os.environ, {"BR_FRESH_EXEC": "1"}):
+                    result = verify.run_fresh(jobs, ids, directory, time.time() + 15, lambda *args: None)
+            finally:
+                os.dup2(saved_stdout, 1)
+                os.close(saved_stdout)
+            self.assertEqual(os.read(read_fd, 4096), b"")
+            os.close(read_fd)
+            self.assertEqual(result[90], ([], []))
+            self.assertEqual(result[91], ([1], [0]))
+            self.assertEqual(result[92], ([], [2, 0]))
+            self.assertNotIn(93, result)
+            self.assertTrue(marker.exists())
+            self.assertNotIn(94, result)  # missing method: no validated result
+            self.assertEqual(result[95], ("broken", None))
 
     def test_failure_skip_and_every_unrun_test_are_retained(self):
         class Example(unittest.TestCase):

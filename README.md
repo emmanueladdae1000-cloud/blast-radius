@@ -54,6 +54,19 @@ than relying on whichever commit is currently on the default branch.
   bytecode anchors, import execution and code-object observers fall back.
 * Verification children have independent CPU budgets. A terminated job retains
   every original candidate, including methods that passed before termination.
+* Exact scalar-literal changes can use the executed LOAD_CONST/RETURN_CONST
+  location, with the same import, introspection and single-file safeguards.
+* Boolean-default edits use raw baseline parameter bindings. A complete observed
+  binding to the opposite exact Boolean proves that invocation supplied its own
+  argument. Shared fixture observations constrain every affected test.
+* Fresh verification starts a clean Python worker, avoiding the selector's large
+  inherited heap. It still runs the complete original test methods.
+
+`default_bindings.json.gz` contains original bindings from two complete pinned
+pytest runs, including class/module fixture scope and reused worker attribution.
+It contains no alternate defaults or mutation outcomes. The historical comparison
+artifact currently excludes all TestOptimizer deductions because the older
+recorder did not reliably attribute shared process-pool input deserialization.
 
 Dynamic baseline maps reflect observed executions. Nondeterminism or execution
 paths not represented in those observations can still affect unseen cases. Only
@@ -87,6 +100,11 @@ alternate comparisons and never applies mutations.
 full official GitHub archive at the exact pinned commit. `rebuild_observations.ps1`
 runs the two baseline seeds and merges complete observations from passing tests.
 Challenge sample inputs/answers and profiling logs are excluded from the production image. Pinned upstream SQLGlot test fixtures remain in src.tar.gz.
+
+`tools/default_plugin.py` records and merges Boolean parameter bindings, with
+fixture scope and process-pool attribution regressions. `tools/validate_defaults.py`
+creates development-only changes and obtains labels from the complete pinned
+pytest suite; its generated data and oracle answers stay outside the image.
 
 ## Prior code and dependencies
 

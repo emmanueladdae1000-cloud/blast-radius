@@ -2,7 +2,39 @@
 
 Latest official score:166.8 seconds,158.849 simulated +7.93 seconds CPU,
 with zero missed commits (receipt BB-C91B3CE1, commit2fb4a1bf5db9).
-The comparison-execution revision below is pending official submission.
+The comparison-execution revision scored167.3 officially with the identical
+158.849 simulated component and zero misses (receipt BB-C2841DBE).
+
+## Current binding/literal/clean-worker candidate
+
+Four new default edits each received full pinned-suite labels:136.733,141.250,
+166.289 and187.066 seconds. The first breaks tests518,972,994,1011,1018;
+the other three break none. Current candidate:4.275 simulated +9.202619 CPU
+=13.477619 total, zero misses on all four.
+
+Three independent literal-keyword changes were labeled by complete suites:
+232.314,158.396 and111.883 seconds. Their failures were[538,589],
+[56,99,1227] and[]. Current candidate:4.050 simulated +18.105672 CPU
+=22.155672 total, zero misses. The three earlier comparison cases also have
+zero misses:8.035 simulated +11.527290 CPU =19.562290 total.
+
+The twelve earlier independent cases score67.500201 total with zero misses.
+Public-sample runs score122.500429,125.541601 and121.938616; median122.5,
+zero misses. CPU-limited verification retains a whole job when incomplete,
+so simulated selection can vary when a marginal check reaches its budget.
+These totals are local dataset aggregates, not official leaderboard scores.
+
+All52 dependency-refinement tests and18 economic/worker tests pass. A full
+original generator-memory test passed in both worker modes with a realistic
+549863-object parent heap:11.516472 CPU seconds in a fork versus2.221775 in a
+clean exec. No sampling or GC freezing is used.
+
+Corrected default profiles each pass1620 tests plus25440 subtests, with1skip:
+211.68 and204.80 seconds. Their artifact has543 sites and144537 site/test
+binding rows;1618 tests are eligible across both seeds. Shared spawn-pool
+argument attribution and worker-final serialization have direct regressions.
+The historical comparison artifact now excludes167 TestOptimizer tests;
+a complete replacement profile with shared fixture attribution is in progress.
 
 ## Comparison-execution revision
 

@@ -14,6 +14,7 @@ import pickle
 import signal
 import struct
 import sys
+import tempfile
 import time
 import types
 import weakref
@@ -389,18 +390,51 @@ def _run_tests(order, ids, mods_by_file):
     return failed, unrun
 
 
+def _fresh_result(files, order, ids, src_root):
+    """Run the same complete patched import and original test methods in either worker."""
+    import importlib
+    _setup(src_root)
+    mods = _install_finder(src_root, files)
+    try:
+        _import_patched(mods)
+    except BaseException as error:
+        sys.stderr.write("verify-fresh: import broken %r\n" % (error,))
+        return {"broken": True}
+    by_file = {}
+    for file in sorted({ids[t].split("::")[0] for t in order}):
+        try:
+            by_file[file] = importlib.import_module(file[:-3].replace("/", "."))
+        except BaseException:
+            pass
+    failed, unrun = _run_tests(order, ids, by_file)
+    return {"failed": failed, "unrun": unrun}
+
+
+def _fresh_worker(request_path, output_path):
+    # Even direct callers receive no test output on their answer channel.
+    os.dup2(2, 1)
+    try:
+        with open(request_path, encoding="utf-8") as source:
+            request = json.load(source)
+        result = _fresh_result(request["files"], request["order"], request["ids"], request["src_root"])
+        with open(output_path, "w", encoding="utf-8") as output:
+            json.dump(result, output)
+        return 0
+    except BaseException:
+        return 1
+
+
 def run_fresh(jobs, ids, src_root, deadline, log):
     """Verification for edits outside function bodies: each job runs in a child that
     imports the patched modules from the patch text (class bodies and metaclasses run
     again), then the candidate tests. Returns {key: ("broken", None) | (failed, unrun)}."""
-    import importlib
     jobs = [_verification_job(job) for job in jobs]
-    t_start = time.time()
+    clean_exec = os.environ.get("BR_FRESH_EXEC", "1") != "0"
     results = {}
     # third-party libraries the test modules need do not depend on sqlglot: import
     # them once here so every forked child shares them.
     need = {ids[t].split("::")[0] for _, _, order, _, _ in jobs for t in order}
-    if need & {"tests/test_optimizer.py", "tests/test_executor.py", "tests/test_schema.py"}:
+    if not clean_exec and need & {"tests/test_optimizer.py", "tests/test_executor.py", "tests/test_schema.py"}:
         try:
             import duckdb  # noqa: F401
             import numpy  # noqa: F401
@@ -416,29 +450,24 @@ def run_fresh(jobs, ids, src_root, deadline, log):
             log("verify-fresh: deadline reached")
             break
         out = os.path.join("/tmp", f"vf_{os.getpid()}_{key}.json")
+        request_path = None
+        if clean_exec:
+            fd, request_path = tempfile.mkstemp(prefix="vf_request_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as request:
+                json.dump({"files": files, "order": order, "ids": ids, "src_root": src_root}, request)
         pid = os.fork()
         if pid == 0:
             code = 1
             try:
                 _arm_cpu_budget(cpu_budget)
-                _setup(src_root)
-                mods = _install_finder(src_root, files)
-                try:
-                    _import_patched(mods)
-                except BaseException as e:
-                    sys.stderr.write("verify-fresh: import broken %r\n" % (e,))
-                    with open(out, "w") as fh:
-                        json.dump({"broken": True}, fh)
-                    os._exit(0)
-                by_file = {}
-                for f in sorted({ids[t].split("::")[0] for t in order}):
-                    try:
-                        by_file[f] = importlib.import_module(f[:-3].replace("/", "."))
-                    except BaseException:
-                        pass
-                failed, unrun = _run_tests(order, ids, by_file)
+                if clean_exec:
+                    # exec discards the selector's large coverage/operand heap.
+                    # Its CPU timer survives exec, covering startup and imports.
+                    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__),
+                                             "--fresh-worker", request_path, out])
+                result = _fresh_result(files, order, ids, src_root)
                 with open(out, "w") as fh:
-                    json.dump({"failed": failed, "unrun": unrun}, fh)
+                    json.dump(result, fh)
                 code = 0
             except BaseException:
                 code = 1
@@ -458,6 +487,11 @@ def run_fresh(jobs, ids, src_root, deadline, log):
             os.remove(out)
         except OSError:
             pass
+        if request_path is not None:
+            try:
+                os.remove(request_path)
+            except OSError:
+                pass
     return results
 
 
@@ -1014,3 +1048,9 @@ def _tpcds_fast_setup(te, rows):
     cls.cache = {}
     cls.tpch_sqls = []
     cls.tpcds_sqls = list(te.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--fresh-worker":
+        os._exit(_fresh_worker(sys.argv[2], sys.argv[3]))
+    raise SystemExit("verify.py is a selector support module")
